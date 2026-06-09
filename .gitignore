@@ -1,0 +1,34 @@
+# Python — lixo gerado
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Ambiente virtual
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor / sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# DADOS E SAÍDAS — nunca versionar
+*.tif
+*.tiff
+*.zarr/
+*.npy
+*.h5
+res_track.txt
+saidas/
+dados/
+
+# Segredos
+*.env
+*.token

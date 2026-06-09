@@ -1,0 +1,9 @@
+napari[all]
+magicgui
+qtpy
+numpy
+pandas
+scikit-image
+tifffile
+matplotlib
+imageio[ffmpeg]
