@@ -40,12 +40,14 @@ validate that accepted batch with a random sample and an empirical error rate.
 - Mask reconciliation: sync the table to the mask, rescue orphan masks, split
   disconnected blobs, auto-track a single cell across the movie.
 - Outcome flags: mitosis, exit, death/senescence, ambiguous.
-- Lineage editing with a confirmation step so a manual link always wins, plus a
-  topology validator and a re-sequencing pass that numbers families by generation.
+- Lineage editing with a confirmation step so a manual link always wins, a visual
+  per-cell lineage editor (parent + daughters), a topology validator and a
+  re-sequencing pass that numbers families by generation.
 - Diagnostics: distributions, flagged-cell lists, morphology outliers and a
   mass-balance check for unexplained cell-count changes.
-- Triage queue with a confidence score, bulk-accept, and a random validation
-  sample that yields an empirical error rate with a 95% confidence interval.
+- Triage queue ranked by within-track anomalies (with population deviation only a
+  minor nudge), bulk-accept, and a random validation sample that yields an
+  empirical error rate with a 95% confidence interval.
 - Assisted gap relinking with linear extrapolation.
 - Statistics: lifetime, migration, motility, area, growth, outcomes, divisions,
   MSD, a temporal-gradient boxplot, per-cell trajectory plots and a custom plot.
@@ -379,6 +381,31 @@ is detached to make room); on Cancel nothing changes.
 > If you later link [A]=5, [B]=20 while 5 already has two daughters and 20 already
 > has another mother, you get a confirmation listing both before it proceeds.
 
+**Edit lineage of [A] (parent + daughters).** Opens a dialog that shows the
+lineage of the cell in [A] and lets you edit it visually in one place, instead of
+juggling the [A]/[B] boxes and separate buttons. It displays the cell's parent
+(`Parent = <id>` or none) and the list of its daughters, and offers:
+
+- **Add as daughter** — type an ID in "Target ID" and add it as a daughter of the
+  current cell.
+- **Remove selected daughter** — detach the daughter selected in the list.
+- **Set as parent** — type an ID in "Target ID" and make it the parent of the
+  current cell.
+- **Remove parent (detach)** — detach the current cell from its mother.
+
+Double-clicking the parent or a daughter jumps the viewer there and re-centers the
+editor on that cell, so the dialog doubles as a small lineage browser. Every change
+goes through the same operations as the buttons above, so the confirmation dialog
+still appears when an edit would override an existing mother or a third daughter,
+and undo/audit behave identically. Removing a parent does not clear the mother's
+Mitosis flag (it may still have another daughter); clear it explicitly with "Clear
+flags of ID [A]" if needed.
+
+> Example: put 5 in [A], open the editor. You see `Parent = none` and daughters
+> `12, 13`. Type 20 in Target ID and click "Add as daughter"; if that would exceed
+> two daughters you get the confirmation. Double-click daughter 12 to jump to it and
+> continue editing 12's own lineage.
+
 **Re-sequence tree (1 → 11, 12).** Renumbers all lineages by generation: the first
 family becomes 1, its daughters 11 and 12, granddaughters 111, 112, and so on.
 Families are numbered by order of appearance. Unrelated cells occupying target IDs
@@ -415,13 +442,22 @@ jumps to its frame and selects it.
   merge or a disappearing cell.
 
 **Open triage queue (large datasets).** Scores each track from 0 to 1 (1 =
-trustworthy), combining how far it sits from the dataset's own distribution in
-area, motility and lifetime (robust z-score via median + MAD) with internal
-anomalies (impossible jump, temporal gap, abrupt area change, missing or
-incoherent outcome). The window lists the worst cells first with score and reason.
-You review the worst, **bulk-accept** the confident remainder (above the cutoff,
-default 0.85, non-destructive — it only logs that those cells left the queue), then
-**draw a validation sample** to validate that batch.
+trustworthy) and lists the worst cells first with score and reason. The score is
+driven primarily by **within-track inconsistencies** — an impossible single-frame
+jump (likely ID swap), a temporal gap, an abrupt area step (fusion/leak, e.g. a
+merge-split that fakes a mitosis), or an outcome that contradicts the trajectory.
+**Population deviation** (how far a track sits from the dataset's own distribution
+in area, motility and lifetime, via robust median + MAD) is only a minor nudge: on
+a heterogeneous, high-density dataset a cell being merely unusual is weak evidence
+that it is wrong, so atypicality alone does not send a cell to review. The
+"no outcome yet" penalty is **scaled by annotation coverage** — on a mostly
+uncurated dataset it is near zero (almost everything is uncurated, so it carries no
+information), and it grows back as you curate, so a lone uncurated straggler in a
+finished dataset becomes notable again. You review the worst, **bulk-accept** the
+confident remainder (above the cutoff, default 0.85, non-destructive — it only logs
+that those cells left the queue), then **draw a validation sample** to validate that
+batch. The scoring constants (`DEVIATION_GAIN`, the penalty weights, the cutoff)
+are defaults at the top of `triage.py` and can be tuned to your data.
 
 **Validation sample.** Step through 50 randomly sampled cells from the accepted
 batch. Mark each OK; if one was wrong, edit it (any edit is captured) and mark OK.
