@@ -33,7 +33,7 @@ from .audit import AuditLog
 from .review import LineageReview
 from .dialogs import TreatmentDialog
 from .tree_plot import lineage_tree_figure
-from .ui_panels import DiagnosticsDialog, RelinkDialog, TriageDialog
+from .ui_panels import DiagnosticsDialog, RelinkDialog, TriageDialog, LineageEditorDialog
 from .validation_dialog import ValidationDialog
 from . import triage as triage_mod
 from . import validation as validation_mod
@@ -367,6 +367,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     btn_flag_clear = PushButton(text="Clear flags of ID [A]")
     lbl_lineage = Label(value="--- LINEAGE / GENEALOGY ---")
     btn_link_parent = PushButton(text="Link mother [A] -> daughter [B]")
+    btn_lineage_editor = PushButton(text="Edit lineage of [A] (parent + daughters)")
     btn_resequence_tree = PushButton(text="Re-sequence tree (1 -> 11, 12)")
     btn_cut_ghosts = PushButton(text="Cut post-mitosis ghosts")
     btn_tree_plot = PushButton(text="Show lineage tree plot")
@@ -429,6 +430,56 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                 return show_info("Link cancelled.")
             res = ops.link_parent(state, a, b, force=True)
         finish(res, "link", [a, b])
+
+    def _ed_link(mother, daughter):
+        """Add/change a lineage link from the editor, honoring confirmation.
+
+        Mirrors the main Link button: runs link_parent, shows the same OK/Cancel
+        dialog when an override needs confirmation, then refreshes visuals and
+        audits WITHOUT clearing the [A]/[B] inputs (the editor manages its own
+        target). Returns (ok, message) for the dialog's status line.
+        """
+        res = ops.link_parent(state, int(mother), int(daughter))
+        if getattr(res, "needs_confirm", False):
+            confirm = QMessageBox.question(
+                None, "Confirm lineage link", res.message,
+                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel)
+            if confirm != QMessageBox.Ok:
+                return False, "Link cancelled."
+            res = ops.link_parent(state, int(mother), int(daughter), force=True)
+        if res.ok:
+            update_visuals()
+            audit.record("link", ids=[int(mother), int(daughter)], detail=res.message)
+            _refresh_lineage_progress()
+            _update_reviewed_button()
+        else:
+            show_error(res.message)
+        return res.ok, res.message
+
+    def _ed_unlink(child):
+        """Detach a parent/daughter link from the editor; refresh + audit."""
+        res = ops.unlink_parent(state, int(child))
+        if res.ok:
+            update_visuals()
+            audit.record("unlink", ids=[int(child)], detail=res.message)
+            _refresh_lineage_progress()
+            _update_reviewed_button()
+        else:
+            show_error(res.message)
+        return res.ok, res.message
+
+    @btn_lineage_editor.clicked.connect
+    def _edit_lineage():
+        a = id_a_input.value
+        if a in (0, None) or int(a) <= 0:
+            return show_error("Put a cell ID in [A] first, then open the editor.")
+        if state.df[state.df[COL_TRACK] == int(a)].empty:
+            return show_error(f"Cell {int(a)} does not exist in the table.")
+        dlg = LineageEditorDialog(None, state, int(a), _ed_link, _ed_unlink, jump_to)
+        open_dialogs["lineage_editor"] = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     @btn_validate.clicked.connect
     def _validate():
@@ -1189,7 +1240,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         lbl_curation, btn_merge, btn_swap_future, btn_swap_local, btn_new_track,
         btn_sync_frame, btn_sync_all, btn_harmonize, btn_delete, btn_delete_track, btn_rescue, btn_autotrack,
         lbl_flags, btn_flag_mitosis, btn_flag_exit, btn_flag_death, btn_flag_ambiguous, btn_flag_clear,
-        lbl_lineage, btn_link_parent, btn_resequence_tree, btn_cut_ghosts, btn_tree_plot,
+        lbl_lineage, btn_link_parent, btn_lineage_editor, btn_resequence_tree, btn_cut_ghosts, btn_tree_plot,
         tree_max_families, tree_include_singles, btn_validate,
         lbl_diag, btn_diagnose, btn_triage, btn_relink, btn_morph, btn_export_cell, btn_export_video, btn_save,
     ])

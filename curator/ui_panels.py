@@ -5,6 +5,8 @@ Auxiliary Qt panels used by the main UI.
     of track lifetime, per-frame displacement and divisions, plus clickable
     lists of flagged cells that jump the viewer to the offending frame/cell.
   * RelinkDialog - review and approve assisted gap-relink suggestions.
+  * LineageEditorDialog - view one cell's parent and daughters and add/remove
+    daughters, change or remove its parent, in a single visual panel.
 
 These import Qt and so are only loaded inside the napari environment.
 """
@@ -15,7 +17,7 @@ import numpy as np
 
 from qtpy.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
-    QLabel, QPushButton, QTabWidget, QWidget,
+    QLabel, QPushButton, QTabWidget, QWidget, QSpinBox,
 )
 from qtpy.QtCore import Qt
 
@@ -23,7 +25,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from . import analysis
-from .config import COL_TRACK, COL_FRAME, COL_X, COL_Y, COL_PARENT
+from .config import COL_TRACK, COL_FRAME, COL_X, COL_Y, COL_PARENT, COL_OUTCOME
 
 
 class DiagnosticsDialog(QDialog):
@@ -331,3 +333,190 @@ class TriageDialog(QDialog):
 
     def _sample(self):
         self.sample_cb(list(self.res.accept))
+
+
+# ---------------------------------------------------------------------------
+# Lineage editor: view and edit one cell's parent and daughters visually
+# ---------------------------------------------------------------------------
+class LineageEditorDialog(QDialog):
+    """View and edit the lineage of a single cell.
+
+    Shows the cell's parent (mother) and its daughters, and lets the user add a
+    daughter, remove a daughter, set/change the parent or detach from the
+    parent. Every mutation is delegated to the curation ops through callbacks,
+    so the conflict-confirmation rules, undo snapshots and audit log are exactly
+    the same as the main panel; this dialog only reads ``state.df`` to display
+    the current state and refreshes after each change. Double-clicking the
+    parent or a daughter jumps the viewer there and re-centres the editor on it,
+    so it doubles as a small lineage browser.
+    """
+
+    def __init__(self, parent, state, tid, link_cb, unlink_cb, jump_cb):
+        super().__init__(parent)
+        self.state = state
+        self.tid = int(tid)
+        self.link_cb = link_cb        # (mother, daughter) -> (ok: bool, msg: str)
+        self.unlink_cb = unlink_cb    # (child,) -> (ok: bool, msg: str)
+        self.jump_cb = jump_cb        # (frame, tid) -> None
+        self.resize(440, 560)
+
+        v = QVBoxLayout(self)
+        self.header = QLabel("")
+        self.header.setWordWrap(True)
+        v.addWidget(self.header)
+
+        # -- parent (mother) --
+        v.addWidget(QLabel("Parent (mother):"))
+        self.parent_label = QLabel("")
+        self.parent_label.setWordWrap(True)
+        v.addWidget(self.parent_label)
+        prow = QHBoxLayout()
+        self.btn_jump_parent = QPushButton("Jump to parent")
+        self.btn_jump_parent.clicked.connect(self._jump_parent)
+        prow.addWidget(self.btn_jump_parent)
+        self.btn_detach_self = QPushButton("Remove parent (detach)")
+        self.btn_detach_self.clicked.connect(self._detach_self)
+        prow.addWidget(self.btn_detach_self)
+        v.addLayout(prow)
+
+        # -- daughters --
+        v.addWidget(QLabel("Daughters (double-click to jump):"))
+        self.daughter_list = QListWidget()
+        self.daughter_list.itemDoubleClicked.connect(self._jump_item)
+        v.addWidget(self.daughter_list)
+        self.btn_remove_daughter = QPushButton("Remove selected daughter")
+        self.btn_remove_daughter.clicked.connect(self._remove_daughter)
+        v.addWidget(self.btn_remove_daughter)
+
+        # -- target-ID input + add / set-parent --
+        irow = QHBoxLayout()
+        irow.addWidget(QLabel("Target ID:"))
+        self.id_spin = QSpinBox()
+        self.id_spin.setRange(0, 2_000_000_000)
+        irow.addWidget(self.id_spin)
+        v.addLayout(irow)
+        arow = QHBoxLayout()
+        self.btn_add_daughter = QPushButton("Add as daughter")
+        self.btn_add_daughter.clicked.connect(self._add_daughter)
+        arow.addWidget(self.btn_add_daughter)
+        self.btn_set_parent = QPushButton("Set as parent")
+        self.btn_set_parent.clicked.connect(self._set_parent)
+        arow.addWidget(self.btn_set_parent)
+        v.addLayout(arow)
+
+        # -- status + close --
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        v.addWidget(self.status)
+        crow = QHBoxLayout()
+        btn_jump_self = QPushButton("Jump to this cell")
+        btn_jump_self.clicked.connect(lambda: self._jump(self.tid))
+        crow.addWidget(btn_jump_self)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        crow.addWidget(btn_close)
+        v.addLayout(crow)
+
+        self._parent_id = None
+        self.refresh()
+
+    # -- read current lineage state ------------------------------------
+    def _first_frame(self, tid):
+        g = self.state.df[self.state.df[COL_TRACK] == int(tid)]
+        return int(g[COL_FRAME].min()) if not g.empty else 0
+
+    def _info(self):
+        from . import lineage as lin
+        df = self.state.df
+        g = df[df[COL_TRACK] == self.tid]
+        exists = not g.empty
+        first = int(g[COL_FRAME].min()) if exists else 0
+        par = g[COL_PARENT]
+        par = par[par > 0]
+        parent = int(par.iloc[0]) if not par.empty else None
+        oc = ""
+        if exists and COL_OUTCOME in g:
+            vals = [str(x) for x in g[COL_OUTCOME] if str(x) not in ("", "nan", "None")]
+            oc = vals[0] if vals else ""
+        daughters = [int(d) for d in lin.classify_lineage(df).children_of.get(self.tid, [])]
+        return exists, first, parent, oc, sorted(daughters)
+
+    def refresh(self):
+        exists, first, parent, oc, daughters = self._info()
+        self._parent_id = parent
+        self.setWindowTitle(f"Lineage editor — cell {self.tid}")
+        head = f"Cell {self.tid}"
+        head += f"  (first frame {first})" if exists else "  (does not exist in the table)"
+        head += f"\nOutcome: {oc}" if oc else "\nOutcome: —"
+        self.header.setText(head)
+
+        self.parent_label.setText(f"Parent = {parent}" if parent is not None
+                                  else "Parent = none")
+        self.btn_jump_parent.setEnabled(parent is not None)
+        self.btn_detach_self.setEnabled(parent is not None)
+
+        self.daughter_list.clear()
+        if daughters:
+            for d in daughters:
+                it = QListWidgetItem(f"  daughter {d}  (frame {self._first_frame(d)})")
+                it.setData(Qt.UserRole, d)
+                self.daughter_list.addItem(it)
+        else:
+            none_row = QListWidgetItem("  (no daughters)")
+            none_row.setFlags(Qt.NoItemFlags)
+            self.daughter_list.addItem(none_row)
+        self.btn_remove_daughter.setEnabled(bool(daughters))
+
+    # -- actions -------------------------------------------------------
+    def _apply(self, result):
+        """Store a (ok, msg) callback result in the status line and refresh."""
+        ok, msg = result
+        self.status.setText(msg)
+        self.refresh()
+
+    def _add_daughter(self):
+        d = int(self.id_spin.value())
+        if d <= 0:
+            self.status.setText("Enter a valid daughter ID in 'Target ID'.")
+            return
+        if d == self.tid:
+            self.status.setText("A cell cannot be its own daughter.")
+            return
+        self._apply(self.link_cb(self.tid, d))   # mother = this cell
+
+    def _set_parent(self):
+        m = int(self.id_spin.value())
+        if m <= 0:
+            self.status.setText("Enter a valid parent ID in 'Target ID'.")
+            return
+        if m == self.tid:
+            self.status.setText("A cell cannot be its own parent.")
+            return
+        self._apply(self.link_cb(m, self.tid))    # daughter = this cell
+
+    def _remove_daughter(self):
+        it = self.daughter_list.currentItem()
+        d = it.data(Qt.UserRole) if it is not None else None
+        if d is None:
+            self.status.setText("Select a daughter in the list first.")
+            return
+        self._apply(self.unlink_cb(int(d)))
+
+    def _detach_self(self):
+        self._apply(self.unlink_cb(self.tid))
+
+    # -- navigation ----------------------------------------------------
+    def _jump(self, tid):
+        self.jump_cb(self._first_frame(int(tid)), int(tid))
+        self.tid = int(tid)                       # re-centre the editor
+        self.status.setText(f"Now editing cell {int(tid)}.")
+        self.refresh()
+
+    def _jump_item(self, item):
+        d = item.data(Qt.UserRole)
+        if d is not None:
+            self._jump(int(d))
+
+    def _jump_parent(self):
+        if self._parent_id is not None:
+            self._jump(int(self._parent_id))
