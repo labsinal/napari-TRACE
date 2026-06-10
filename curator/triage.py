@@ -17,28 +17,35 @@ probably fine. The workflow this module enables is "curate by exception":
   4. validation_sample()-> a random sample of the accepted bucket to eyeball,
                            giving a defensible empirical error rate for a paper.
 
-Per-characteristic scoring (this build)
----------------------------------------
-Each cell characteristic ("dimension") gets a 0..1 sub-score with TWO parts:
+Per-characteristic scoring
+--------------------------
+Each cell characteristic ("dimension") gets a 0..1 sub-score with TWO parts,
+and the design deliberately makes WITHIN-track inconsistency the primary driver
+and mere atypicality a weak secondary nudge. On heterogeneous / high-density
+datasets a cell being unusual is poor evidence that it is wrong, so deviation
+alone should rarely send a cell to review.
 
-  (A) Population deviation -- the PRIMARY driver. For the continuous traits
-      (area, mobility, lifetime) the track's own value is compared to the
-      distribution of that trait across the CURRENT dataset (computed when the
-      triage runs). A track that sits near the population centre scores ~1; the
-      farther it is (in robust z = |value - median| / (1.4826*MAD)), the lower
-      its sub-score, via a Gaussian fall-off with a 1-sigma free zone. So if the
-      dataset's typical lifetime is ~27 frames and a track lived ~11, its
-      lifetime sub-score drops because it is far from the population.
+  (A) Local anomaly penalties -- the PRIMARY driver. WITHIN-track red flags the
+      population cannot see: an impossible single-frame jump (likely ID swap), a
+      temporal gap, a sudden area step (fusion/leak, e.g. a merge-split that
+      fakes a mitosis), a missing or incoherent outcome. These reduce the
+      relevant dimension's sub-score.
 
-  (B) Local anomaly penalties -- WITHIN-track red flags the population can't see
-      (an impossible single-frame jump = likely ID swap, a temporal gap, a
-      sudden area step = fusion/leak, a missing/incoherent outcome). These apply
-      as a further multiplicative reduction on the relevant dimension.
+  (B) Population deviation -- a SECONDARY nudge, attenuated by DEVIATION_GAIN.
+      For the continuous traits (area, mobility, lifetime) the track's value is
+      compared to the dataset distribution (robust z = |value - median| /
+      (1.4826*MAD)); being far off lowers the sub-score only slightly. With
+      DEVIATION_GAIN = 1.0 this reverts to the old deviation-dominated behaviour.
 
-      area      <- deviation(mean area)   x  area_jump
-      mobility  <- deviation(mean step)   x  jump
-      lifetime  <- deviation(n_frames)    x  gap
-      outcome   <- no_outcome, outcome_incoherent     (penalty-only; categorical)
+      area      <- area_jump      x  small_deviation(mean area)
+      mobility  <- jump           x  small_deviation(mean step)
+      lifetime  <- gap            x  small_deviation(n_frames)
+      outcome   <- no_outcome (coverage-adaptive), outcome_incoherent
+
+The ``no_outcome`` penalty is scaled by annotation COVERAGE: on a mostly
+uncurated dataset "has no outcome yet" is true of nearly everything and carries
+no information, so it is down-weighted toward zero; as more cells are curated an
+uncurated straggler becomes genuinely notable and the penalty returns to full.
 
 A single-frame track (no trajectory at all) has its temporal characteristics
 (mobility, lifetime) hard-zeroed regardless. The FINAL aggregate score is
@@ -69,32 +76,23 @@ DEFAULT_WEIGHTS = {
     "jump": 0.30,                # an impossible step -> likely an ID swap
     "gap": 0.20,                 # a temporal hole -> possible missed detection
     "outcome_incoherent": 0.25,  # outcome contradicts what the trajectory shows
-    "area_jump": 0.10,           # sudden area change (possible fusion/leak)
+    "area_jump": 0.18,           # sudden area change (fusion/leak; merge-split)
 }
-
-# --- "no outcome" should not dominate an UNCURATED dataset --------------------
-# Historically every track lacking a final outcome took the full ``no_outcome``
-# penalty (0.45). On a freshly-loaded dataset almost no cell has an outcome yet,
-# so almost every cell lost 0.45 and fell under the triage cutoff -- making
-# "low score" mean "not annotated yet" rather than "suspicious", and flagging
-# 80%+ of cells.
-#
-# Fix: a missing outcome is only anomalous if outcomes are common in the CURRENT
-# dataset. We scale the no_outcome penalty by the fraction of tracks that DO
-# carry an outcome (the "annotation coverage"): when coverage is ~0 (nothing
-# annotated) the penalty is ~0 (lacking an outcome is the norm); as you curate
-# and coverage rises, lacking an outcome becomes the exception and the penalty
-# grows back toward its full weight. Outcome *incoherence* (an outcome that
-# contradicts the trajectory) is unaffected -- it is always a real red flag.
-NO_OUTCOME_MIN_COVERAGE = 0.10   # below this coverage, treat "no outcome" as neutral
 
 # --- population-deviation parameters (the relationship to the dataset means) ---
 # Robust z = |value - centre| / scale. Within DEVIATION_FREE_Z robust-sigma the
 # sub-score is 1.0; beyond it, a Gaussian fall-off with width DEVIATION_TOLERANCE
 # (in robust-sigma) brings the sub-score down. Smaller tolerance / free-zone =>
 # stricter (a track must hug the population centre to score high).
-DEVIATION_FREE_Z = 1.0       # robust-sigma of "this is normal", scored 1.0
+DEVIATION_FREE_Z = 1.5       # robust-sigma of "this is normal", scored 1.0
 DEVIATION_TOLERANCE = 1.25   # Gaussian width (robust-sigma) of the fall-off
+# How much population deviation is allowed to lower a sub-score. The score
+# prioritizes within-track inconsistency over atypicality, so deviation only
+# nudges. Kept at/below (1 - cutoff) so that a single deviating axis alone never
+# pushes a cell below the default 0.85 review cutoff: only a real within-track
+# anomaly, or atypicality on several axes at once, sends a cell to review. 1.0 =
+# old deviation-dominated behaviour; 0.0 = ignore population deviation entirely.
+DEVIATION_GAIN = 0.15
 DEVIATION_REASON_SCORE = 0.75   # add an explanatory reason below this sub-score
 MIN_POP_FOR_STATS = 5        # need at least this many tracks to trust a distribution
 DEVIATION_CENTER = "median"  # "median" (robust, default) or "mean"
@@ -144,6 +142,7 @@ class TriageResult:
     accept: list = field(default_factory=list)   # track_ids confident enough
     cutoff: float = 0.0
     population: dict = field(default_factory=dict)  # {dim: {center, scale, mean, n}}
+    coverage: float = 0.0                           # annotation coverage in [0,1]
 
     def summary(self) -> str:
         n = len(self.scores)
@@ -151,7 +150,8 @@ class TriageResult:
             return "No cells to triage."
         base = (f"{n} cells: {len(self.review)} to review "
                 f"({100*len(self.review)/n:.0f}%), {len(self.accept)} accept "
-                f"({100*len(self.accept)/n:.0f}%) at cutoff {self.cutoff:.2f}.")
+                f"({100*len(self.accept)/n:.0f}%) at cutoff {self.cutoff:.2f} "
+                f"[annotation coverage {100*self.coverage:.0f}%].")
         if self.population:
             bits = []
             for dim, st in self.population.items():
@@ -209,6 +209,29 @@ def _center_scale(values, center=DEVIATION_CENTER):
     if scale <= 1e-9:
         return None
     return {"center": c, "scale": scale, "mean": mean, "median": med, "n": int(v.size)}
+
+
+def annotation_coverage(df):
+    """Fraction of non-quarantined tracks that already have a final outcome.
+
+    Used to make the ``no_outcome`` penalty adaptive: at coverage ~0 (a fresh,
+    uncurated dataset) "no outcome" is non-discriminative and is down-weighted
+    to near zero; at coverage ~1 an uncurated straggler is notable and keeps the
+    full penalty. Returns a float in [0, 1].
+    """
+    if df is None or df.empty or COL_OUTCOME not in df.columns:
+        return 0.0
+    d = df.dropna(subset=[COL_TRACK]).copy()
+    if d.empty:
+        return 0.0
+    d[COL_TRACK] = d[COL_TRACK].astype(int)
+    d = d[(d[COL_TRACK] > 0) & (~d[COL_TRACK].map(is_quarantined_id))]
+    if d.empty:
+        return 0.0
+    finals = set(FINAL_OUTCOMES)
+    has_final = d.groupby(COL_TRACK)[COL_OUTCOME].agg(
+        lambda s: bool(set(s.astype(str)) & finals))
+    return float(has_final.mean()) if has_final.size else 0.0
 
 
 def population_stats(df, center=DEVIATION_CENTER):
@@ -332,6 +355,12 @@ def score_cells(df, thresholds, mask=None, weights=None, center=DEVIATION_CENTER
         for dim in DEVIATION_DIMS}
 
     # Reuse the (calibrated) anomaly detector as the backbone of the signals.
+    # Annotation coverage drives the adaptive no_outcome weight (see module
+    # docstring): on an uncurated dataset "no outcome" floods the queue without
+    # discriminating, so its penalty is scaled down toward zero.
+    coverage = annotation_coverage(d)
+    w["no_outcome"] = w["no_outcome"] * coverage
+
     rep = analysis.detect_anomalies(d, thresholds, include_outcome_checks=True)
     gap_ids = set(rep.gaps)
     jump_ids = set(rep.jumps)
@@ -342,25 +371,6 @@ def score_cells(df, thresholds, mask=None, weights=None, center=DEVIATION_CENTER
             no_outcome_ids.add(int(str(msg).split()[1]))
         except (IndexError, ValueError):
             pass
-
-    # How much of the dataset is actually annotated? If almost nothing has an
-    # outcome yet (a freshly-loaded, uncurated movie), then lacking an outcome is
-    # the NORM, not an anomaly, and must not drive the score down -- otherwise
-    # ~every cell flags. We scale the no_outcome penalty by the annotation
-    # coverage so it ramps in only as the dataset gets curated. See
-    # NO_OUTCOME_MIN_COVERAGE.
-    all_track_ids = set(int(t) for t in d[COL_TRACK].unique()
-                        if not is_quarantined_id(t))
-    n_tracks = max(1, len(all_track_ids))
-    n_with_outcome = len(all_track_ids - no_outcome_ids)
-    coverage = n_with_outcome / n_tracks
-    if coverage <= NO_OUTCOME_MIN_COVERAGE:
-        no_outcome_factor = 0.0
-    else:
-        # Linear ramp from 0 at the floor to 1.0 at full coverage.
-        no_outcome_factor = (coverage - NO_OUTCOME_MIN_COVERAGE) / (1.0 - NO_OUTCOME_MIN_COVERAGE)
-        no_outcome_factor = float(min(1.0, max(0.0, no_outcome_factor)))
-    effective_no_outcome = w["no_outcome"] * no_outcome_factor
 
     # Human-readable reason per signal (for the review list / tooltips).
     reason_text = {
@@ -376,8 +386,8 @@ def score_cells(df, thresholds, mask=None, weights=None, center=DEVIATION_CENTER
             continue
 
         penalties = {}
-        if int(tid) in no_outcome_ids and effective_no_outcome > 0:
-            penalties["no_outcome"] = effective_no_outcome
+        if int(tid) in no_outcome_ids:
+            penalties["no_outcome"] = w["no_outcome"]
         if int(tid) in jump_ids:
             penalties["jump"] = w["jump"]
         if int(tid) in gap_ids:
@@ -415,7 +425,9 @@ def score_cells(df, thresholds, mask=None, weights=None, center=DEVIATION_CENTER
             if dim in DEVIATION_DIMS:
                 st = pop.get(dim)
                 value = metrics[dim].get(int(tid)) if dim in metrics else None
-                dev = _deviation_score(value, st)
+                dev_raw = _deviation_score(value, st)
+                # Attenuate: deviation only nudges the sub-score (see B0 design).
+                dev = 1.0 - DEVIATION_GAIN * (1.0 - dev_raw)
                 sub = dev * local
                 if st is not None and dev < DEVIATION_REASON_SCORE \
                         and value is not None and np.isfinite(value):
@@ -464,7 +476,8 @@ def triage_queue(df, thresholds, mask=None, cutoff=0.85, weights=None,
     review = [c.track_id for c in scores if c.score < cutoff]
     accept = [c.track_id for c in scores if c.score >= cutoff]
     return TriageResult(scores=scores, review=review, accept=accept,
-                        cutoff=cutoff, population=pop)
+                        cutoff=cutoff, population=pop,
+                        coverage=annotation_coverage(df))
 
 
 def validation_sample(accept_ids, n=50, seed=None):
