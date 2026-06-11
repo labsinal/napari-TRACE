@@ -1,4 +1,5 @@
-# Cell Tracking Curator
+#Napari-TRACE
+##Tracking Review and Correction Engine
 
 A [napari](https://napari.org)-based desktop tool for reviewing and correcting
 automated cell-tracking results from time-lapse microscopy. It overlays the raw
