@@ -25,6 +25,7 @@ validate that accepted batch with a random sample and an empirical error rate.
 - [Input data](#input-data)
 - [The loading flow](#the-loading-flow)
 - [Core concepts](#core-concepts)
+- [Keyboard shortcuts](#keyboard-shortcuts)
 - [Curation tools](#curation-tools)
 - [Statistics tools](#statistics-tools)
 - [Generated files](#generated-files)
@@ -43,10 +44,12 @@ validate that accepted batch with a random sample and an empirical error rate.
 - Lineage editing with a confirmation step so a manual link always wins, a visual
   per-cell lineage editor (parent + daughters), a topology validator and a
   re-sequencing pass that numbers families by generation.
-- Diagnostics: distributions, flagged-cell lists, morphology outliers and a
+- Diagnostics: distributions, flagged-cell lists, morphology outliers, an
+  identity-swap detector for label exchanges that leave no jump or gap, and a
   mass-balance check for unexplained cell-count changes.
-- Triage queue ranked by within-track anomalies (with population deviation only a
-  minor nudge), bulk-accept, and a random validation sample that yields an
+- Triage queue driven by within-track tracking-error signals, with biological
+  outliers (cells far from the population) surfaced separately instead of being
+  treated as errors; bulk-accept, and a random validation sample that yields an
   empirical error rate with a 95% confidence interval.
 - Assisted gap relinking with linear extrapolation.
 - Statistics: lifetime, migration, motility, area, growth, outcomes, divisions,
@@ -258,6 +261,45 @@ snapshot the entire stack; the rest snapshot only the frames they touch.
 
 ---
 
+## Keyboard shortcuts
+
+Most-used tools have single-key shortcuts so you can curate without leaving the
+canvas. They act on the current **[A]**/**[B]** selection and the current frame,
+exactly like the matching buttons (selection still comes from Shift/Ctrl+click).
+
+The shortcuts are registered with `overwrite=True`, so they always fire even when
+napari binds the same key. The **manual-painting keys are deliberately left to
+napari**: the number row (Labels layer modes), `m` (new label) and the brush keys
+keep their napari meaning, so painting masks by hand is unaffected.
+
+| Key | Action |
+|---|---|
+| `Shift` + click | Set **[A]** (target / mother) |
+| `Ctrl` + click | Set **[B]** (destination / daughter) |
+| `d` | Flag **[A]** as Mitosis (division) |
+| `w` | Flag **[A]** as Exit (left the field) |
+| `k` | Flag **[A]** as Death / Senescence |
+| `b` | Flag **[A]** as Ambiguous |
+| `c` | Clear flags of **[A]** |
+| `g` | Merge **[A]** into **[B]** (whole movie) |
+| `s` | Swap / cut from this frame onward |
+| `Shift` + `s` | Local swap (this frame only) |
+| `n` | Relabel **[A]** mask to a new ID |
+| `y` | Sync masks (this frame) |
+| `x` | Delete **[A]** (this frame) |
+| `l` | Link mother **[A]** → daughter **[B]** |
+| `f` | Toggle Focus mode |
+| `Shift` + `f` | Toggle Lineage focus |
+| `.` | Jump to next unreviewed lineage |
+| `,` | Jump to next cell without lineage |
+| `Ctrl` + `Z` | Undo |
+| `Ctrl` + `S` | Save all (backup + atomic) |
+
+Because the shortcuts are single keys on the canvas, a stray keypress while a cell
+is selected can apply an unintended edit; `Ctrl+Z` reverts it.
+
+---
+
 ## Curation tools
 
 ### Setup
@@ -442,22 +484,35 @@ jumps to its frame and selects it.
   merge or a disappearing cell.
 
 **Open triage queue (large datasets).** Scores each track from 0 to 1 (1 =
-trustworthy) and lists the worst cells first with score and reason. The score is
-driven primarily by **within-track inconsistencies** — an impossible single-frame
-jump (likely ID swap), a temporal gap, an abrupt area step (fusion/leak, e.g. a
-merge-split that fakes a mitosis), or an outcome that contradicts the trajectory.
-**Population deviation** (how far a track sits from the dataset's own distribution
-in area, motility and lifetime, via robust median + MAD) is only a minor nudge: on
-a heterogeneous, high-density dataset a cell being merely unusual is weak evidence
-that it is wrong, so atypicality alone does not send a cell to review. The
-"no outcome yet" penalty is **scaled by annotation coverage** — on a mostly
-uncurated dataset it is near zero (almost everything is uncurated, so it carries no
-information), and it grows back as you curate, so a lone uncurated straggler in a
-finished dataset becomes notable again. You review the worst, **bulk-accept** the
-confident remainder (above the cutoff, default 0.85, non-destructive — it only logs
-that those cells left the queue), then **draw a validation sample** to validate that
-batch. The scoring constants (`DEVIATION_GAIN`, the penalty weights, the cutoff)
-are defaults at the top of `triage.py` and can be tuned to your data.
+trustworthy) and lists the worst cells first with score and reason. The queue is
+driven by a **tracking-error score** built only from within-track inconsistencies
+— an impossible single-frame jump (likely ID swap), a temporal gap, an abrupt area
+step (fusion/leak, e.g. a merge-split that fakes a mitosis), or an outcome that
+contradicts the trajectory. **Population deviation** (how far a track sits from the
+dataset's own distribution in area, motility and lifetime, via robust median + MAD)
+is computed as a **separate** score and is **not** mixed into the queue: a cell
+that is merely unusual is not evidence that it is wrong, so atypicality alone never
+sends a cell to review. Cells far from the population are instead listed in a
+**Biological outliers** section of the dialog for inspection — this is where real
+rare phenotypes (a giant cell, an unusually long-lived one, a hyper-motile one)
+show up without being mislabelled as errors. You review the worst, **bulk-accept**
+the confident remainder (above the cutoff, default 0.85, non-destructive — it only
+logs that those cells left the queue), then **draw a validation sample** to validate
+that batch. The penalty weights, the cutoff and the deviation parameters are
+defaults at the top of `triage.py`; pass `blend_deviation=True` to `triage_queue`
+to fold deviation back into the score (the legacy combined behaviour).
+
+**Detect identity swaps (no jump).** Finds frame transitions where two nearby
+tracks most likely exchanged labels. A clean swap leaves no jump, no gap and
+conserves the cell count, so the per-track checks miss it; this looks instead for
+two co-existing tracks whose next-frame assignment is cheaper when **swapped** (A
+lands where B was and vice versa). When per-frame area is available, each row is
+marked (★) when **area continuity corroborates** the swap (A inherits B's area and
+vice versa), which separates a real label swap from two cells that merely cross
+paths. It does **not** edit anything: double-click a row to jump to the transition
+with the pair loaded into **[A]** and **[B]**, then fix it with Swap/cut (`s`) or
+Local swap (`Shift+s`). Search radius and cost margin are in the thresholds
+(`swap_search_radius_px`, `swap_cost_margin`).
 
 **Validation sample.** Step through 50 randomly sampled cells from the accepted
 batch. Mark each OK; if one was wrong, edit it (any edit is captured) and mark OK.

@@ -2,10 +2,11 @@
 Analysis primitives: centroids, anomaly detection, morphology and per-track
 summaries.
 
-Provides a single anomaly detector shared by the diagnostics panel and the
-pre-save filter, a vectorized centroid helper, and morphology-based
-segmentation error detection (area/solidity/eccentricity) using
-outlier-robust statistics (median + MAD).
+Addresses:
+  * Item 5  - single anomaly detector shared by diagnostics and save.
+  * Item 7  - one vectorized centroid helper replacing five hand-rolled loops.
+  * Item 12 - morphology-based segmentation error detection (area/solidity/
+              eccentricity) using outlier-robust statistics (median + MAD).
 """
 
 from __future__ import annotations
@@ -21,12 +22,12 @@ from .config import (
     OUTCOME_MITOSIS, OUTCOME_EXIT, OUTCOME_DEATH, TREAT_CONTROL, Thresholds,
 )
 
-# skimage is a hard dependency of the curator.
+# skimage is a hard dependency of the curator; import at top (item 9).
 from skimage.measure import label as cc_label, regionprops_table
 
 
 # ---------------------------------------------------------------------------
-# Vectorized centroids
+# Item 7: vectorized centroids
 # ---------------------------------------------------------------------------
 def centroids_for_frame(mask_plane: np.ndarray) -> dict[int, tuple[float, float]]:
     """Return {label_id: (x, y)} centroids for every nonzero label in a plane.
@@ -68,7 +69,7 @@ def areas_for_frame(mask_plane: np.ndarray, pixel_area: float = 1.0) -> dict[int
 
 
 # ---------------------------------------------------------------------------
-# Anomaly detection
+# Item 5: unified anomaly detection
 # ---------------------------------------------------------------------------
 @dataclass
 class AnomalyReport:
@@ -92,7 +93,7 @@ def detect_anomalies(df: pd.DataFrame, thresholds: Thresholds,
                      include_outcome_checks: bool = True) -> AnomalyReport:
     """Single source of truth for short tracks, gaps, jumps and outcome issues.
 
-    Used by both the diagnostic panel and the pre-save filter, so the
+    Used by both the diagnostic panel (item 14) and the pre-save filter, so the
     two can never drift apart again. Quarantined IDs are skipped.
     """
     rep = AnomalyReport()
@@ -160,7 +161,7 @@ def detect_anomalies(df: pd.DataFrame, thresholds: Thresholds,
 
 
 # ---------------------------------------------------------------------------
-# Morphology-based segmentation errors (median + MAD)
+# Item 12: morphology-based segmentation errors (median + MAD)
 # ---------------------------------------------------------------------------
 def _robust_outliers(values: np.ndarray, k: float):
     """Return a boolean 'too large' mask using median + MAD (robust to outliers)."""
@@ -215,6 +216,140 @@ def detect_morphology_errors(mask: np.ndarray, thresholds: Thresholds) -> pd.Dat
                              "eccentricity": ecc, "reason": "; ".join(reasons)})
     return pd.DataFrame(rows, columns=["frame", "track_id", "area", "solidity",
                                        "eccentricity", "reason"])
+
+
+# ---------------------------------------------------------------------------
+# Identity-swap detection (label exchange between two co-existing tracks)
+# ---------------------------------------------------------------------------
+def _area_lookup_from_df(df):
+    """Return {(frame, track_id): area} from COL_AREA if present, else {}."""
+    if df is None or config.COL_AREA not in df.columns:
+        return {}
+    sub = df.dropna(subset=[COL_FRAME, COL_TRACK, config.COL_AREA])
+    if sub.empty:
+        return {}
+    keys = zip(sub[COL_FRAME].astype(int).to_numpy().tolist(),
+               sub[COL_TRACK].astype(int).to_numpy().tolist())
+    return dict(zip(keys, sub[config.COL_AREA].astype(float).to_numpy().tolist()))
+
+
+def detect_identity_swaps(df: pd.DataFrame, thresholds: Thresholds) -> pd.DataFrame:
+    """Flag frame transitions where two co-existing tracks likely swapped labels.
+
+    A clean label swap leaves no jump, no gap and conserves the cell count, so
+    the per-track checks miss it. Its signature is two nearby tracks A and B
+    whose frame f -> f+1 assignment is cheaper when exchanged: A lands where B
+    was and B lands where A was. For each frame pair the nearest neighbour of
+    every track is tested as a swap partner; a pair is flagged when the swapped
+    assignment beats the kept assignment by ``swap_cost_margin`` (and at least
+    ``swap_min_improvement_px``) and the two were within ``swap_search_radius_px``.
+
+    When per-frame areas are available (COL_AREA) the result also reports whether
+    the swap is corroborated by area continuity (A inherits B's area and vice
+    versa), which separates real label swaps from cells that merely cross paths.
+
+    Returns columns: frame, track_a, track_b, separation, cost_improvement,
+    area_corroborates. Sorted with corroborated, larger-improvement swaps first.
+    """
+    cols = ["frame", "track_a", "track_b", "separation",
+            "cost_improvement", "area_corroborates"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+
+    d = df.dropna(subset=[COL_TRACK, COL_FRAME, COL_X, COL_Y]).copy()
+    if d.empty:
+        return pd.DataFrame(columns=cols)
+    d[COL_TRACK] = d[COL_TRACK].astype(int)
+    d = d[(d[COL_TRACK] > 0) & (~d[COL_TRACK].map(config.is_quarantined_id))]
+    if d.empty:
+        return pd.DataFrame(columns=cols)
+
+    pos = {}
+    for f, g in d.groupby(d[COL_FRAME].astype(int)):
+        ids = g[COL_TRACK].to_numpy(dtype=int)
+        xy = np.column_stack([g[COL_X].to_numpy(float), g[COL_Y].to_numpy(float)])
+        pos[int(f)] = (ids, xy, {int(t): k for k, t in enumerate(ids)})
+
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:
+        cKDTree = None
+
+    area_at = _area_lookup_from_df(d)
+    R = float(thresholds.swap_search_radius_px)
+    margin = float(thresholds.swap_cost_margin)
+    min_impr = float(thresholds.swap_min_improvement_px)
+
+    rows = []
+    frames = sorted(pos)
+    for f in frames:
+        nxt = f + 1
+        if nxt not in pos:
+            continue
+        ids0, xy0, _ = pos[f]
+        _, _, idx1 = pos[nxt]
+        common_mask = np.array([t in idx1 for t in ids0])
+        if common_mask.sum() < 2:
+            continue
+        ids = ids0[common_mask]
+        P0 = xy0[common_mask]
+        P1 = pos[nxt][1][np.array([idx1[int(t)] for t in ids])]
+
+        if cKDTree is not None:
+            tree = cKDTree(P0)
+            dists, nbrs = tree.query(P0, k=2)
+            partner = nbrs[:, 1]
+            sep = dists[:, 1]
+        else:
+            diff = P0[:, None, :] - P0[None, :, :]
+            dmat = np.sqrt((diff ** 2).sum(axis=2))
+            np.fill_diagonal(dmat, np.inf)
+            partner = dmat.argmin(axis=1)
+            sep = dmat[np.arange(len(P0)), partner]
+
+        seen = set()
+        for i in range(len(ids)):
+            j = int(partner[i])
+            key = (min(i, j), max(i, j))
+            if key in seen:
+                continue
+            seen.add(key)
+            if sep[i] > R:
+                continue
+            d_ii = float(np.hypot(*(P1[i] - P0[i])))
+            d_jj = float(np.hypot(*(P1[j] - P0[j])))
+            d_ij = float(np.hypot(*(P1[i] - P0[j])))
+            d_ji = float(np.hypot(*(P1[j] - P0[i])))
+            kept = d_ii + d_jj
+            swapped = d_ij + d_ji
+            improvement = kept - swapped
+            if not (d_ij < d_ii and d_ji < d_jj):
+                continue
+            if improvement < max(margin * kept, min_impr):
+                continue
+
+            a, b = int(ids[i]), int(ids[j])
+            corroborates = False
+            if area_at:
+                aa0, ab0 = area_at.get((f, a)), area_at.get((f, b))
+                aa1, ab1 = area_at.get((nxt, a)), area_at.get((nxt, b))
+                if None not in (aa0, ab0, aa1, ab1):
+                    keep_da = abs(aa1 - aa0) + abs(ab1 - ab0)
+                    swap_da = abs(aa1 - ab0) + abs(ab1 - aa0)
+                    corroborates = swap_da < keep_da
+            rows.append({
+                "frame": int(f), "track_a": a, "track_b": b,
+                "separation": round(float(sep[i]), 2),
+                "cost_improvement": round(float(improvement), 2),
+                "area_corroborates": bool(corroborates),
+            })
+
+    out = pd.DataFrame(rows, columns=cols)
+    if not out.empty:
+        out = out.sort_values(
+            ["area_corroborates", "cost_improvement"],
+            ascending=[False, False]).reset_index(drop=True)
+    return out
 
 
 # ---------------------------------------------------------------------------

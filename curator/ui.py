@@ -3,7 +3,7 @@ napari UI assembly.
 
 Builds the viewer, layers, the curation panel, the statistics panel (with the
 customizable plots and the temporal-gradient scatter) and wires the navigable
-diagnostics panel and the relink dialog.
+diagnostics panel (item 14) and the relink dialog (item 13).
 
 All heavy logic is delegated to the tested core modules; this file is wiring
 and presentation only. It is imported only inside the napari environment.
@@ -33,7 +33,7 @@ from .audit import AuditLog
 from .review import LineageReview
 from .dialogs import TreatmentDialog
 from .tree_plot import lineage_tree_figure
-from .ui_panels import DiagnosticsDialog, RelinkDialog, TriageDialog, LineageEditorDialog
+from .ui_panels import DiagnosticsDialog, RelinkDialog, TriageDialog, SwapDialog
 from .validation_dialog import ValidationDialog
 from . import triage as triage_mod
 from . import validation as validation_mod
@@ -367,7 +367,6 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     btn_flag_clear = PushButton(text="Clear flags of ID [A]")
     lbl_lineage = Label(value="--- LINEAGE / GENEALOGY ---")
     btn_link_parent = PushButton(text="Link mother [A] -> daughter [B]")
-    btn_lineage_editor = PushButton(text="Edit lineage of [A] (parent + daughters)")
     btn_resequence_tree = PushButton(text="Re-sequence tree (1 -> 11, 12)")
     btn_cut_ghosts = PushButton(text="Cut post-mitosis ghosts")
     btn_tree_plot = PushButton(text="Show lineage tree plot")
@@ -378,6 +377,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     btn_diagnose = PushButton(text="Open diagnostics panel")
     btn_triage = PushButton(text="Open triage queue (large datasets)")
     btn_relink = PushButton(text="Assisted gap relinking")
+    btn_swaps = PushButton(text="Detect identity swaps (no jump)")
     btn_morph = PushButton(text="Detect segmentation errors (morphology)")
     btn_export_cell = PushButton(text="Export cell [A] video")
     btn_export_video = PushButton(text="Export presentation (screen)")
@@ -420,66 +420,8 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     # ---- lineage ----
     @btn_link_parent.clicked.connect
     def _link():
-        a, b = id_a_input.value, id_b_input.value
-        res = ops.link_parent(state, a, b)
-        if getattr(res, "needs_confirm", False):
-            confirm = QMessageBox.question(
-                None, "Confirm lineage link", res.message,
-                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel)
-            if confirm != QMessageBox.Ok:
-                return show_info("Link cancelled.")
-            res = ops.link_parent(state, a, b, force=True)
-        finish(res, "link", [a, b])
-
-    def _ed_link(mother, daughter):
-        """Add/change a lineage link from the editor, honoring confirmation.
-
-        Mirrors the main Link button: runs link_parent, shows the same OK/Cancel
-        dialog when an override needs confirmation, then refreshes visuals and
-        audits WITHOUT clearing the [A]/[B] inputs (the editor manages its own
-        target). Returns (ok, message) for the dialog's status line.
-        """
-        res = ops.link_parent(state, int(mother), int(daughter))
-        if getattr(res, "needs_confirm", False):
-            confirm = QMessageBox.question(
-                None, "Confirm lineage link", res.message,
-                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel)
-            if confirm != QMessageBox.Ok:
-                return False, "Link cancelled."
-            res = ops.link_parent(state, int(mother), int(daughter), force=True)
-        if res.ok:
-            update_visuals()
-            audit.record("link", ids=[int(mother), int(daughter)], detail=res.message)
-            _refresh_lineage_progress()
-            _update_reviewed_button()
-        else:
-            show_error(res.message)
-        return res.ok, res.message
-
-    def _ed_unlink(child):
-        """Detach a parent/daughter link from the editor; refresh + audit."""
-        res = ops.unlink_parent(state, int(child))
-        if res.ok:
-            update_visuals()
-            audit.record("unlink", ids=[int(child)], detail=res.message)
-            _refresh_lineage_progress()
-            _update_reviewed_button()
-        else:
-            show_error(res.message)
-        return res.ok, res.message
-
-    @btn_lineage_editor.clicked.connect
-    def _edit_lineage():
-        a = id_a_input.value
-        if a in (0, None) or int(a) <= 0:
-            return show_error("Put a cell ID in [A] first, then open the editor.")
-        if state.df[state.df[COL_TRACK] == int(a)].empty:
-            return show_error(f"Cell {int(a)} does not exist in the table.")
-        dlg = LineageEditorDialog(None, state, int(a), _ed_link, _ed_unlink, jump_to)
-        open_dialogs["lineage_editor"] = dlg
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        finish(ops.link_parent(state, id_a_input.value, id_b_input.value),
+               "link", [id_a_input.value, id_b_input.value])
 
     @btn_validate.clicked.connect
     def _validate():
@@ -743,7 +685,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         finish(ops.autotrack(state, id_a_input.value, treatment_config),
                "autotrack", [id_a_input.value])
 
-    # ---- diagnostics ----
+    # ---- diagnostics (item 14) ----
     # Keep references to open dialogs so they are not garbage-collected
     # (a non-parented QDialog with no Python reference can vanish immediately).
     open_dialogs = {}
@@ -841,6 +783,28 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         dlg.raise_()
         dlg.activateWindow()
 
+    def jump_pair(frame, a, b):
+        """Jump to a frame and load a pair of tracks into [A] and [B]."""
+        id_a_input.value = int(a)
+        id_b_input.value = int(b)
+        viewer.dims.current_step = (int(frame), 0, 0)
+        labels_layer.selected_label = int(a)
+        show_info(f"Frame {frame}: [A]={a}, [B]={b}. Use Swap/cut (s) or "
+                  f"Local swap (Shift+S) to fix.")
+
+    @btn_swaps.clicked.connect
+    def _swaps():
+        sw = analysis.detect_identity_swaps(state.df, thresholds)
+        if sw.empty:
+            return show_info("No suspected identity swaps found.")
+        n_corr = int(sw["area_corroborates"].sum())
+        show_info(f"{len(sw)} suspected swap(s); {n_corr} corroborated by area.")
+        dlg = SwapDialog(None, sw, jump_pair)
+        open_dialogs["swaps"] = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
     # ---- export ----
     @btn_export_cell.clicked.connect
     def _exp_cell():
@@ -895,7 +859,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         imageio.mimsave(path, frames, fps=10)
         show_info("Presentation exported.")
 
-    # ---- save ----
+    # ---- save (item 3 + unified anomaly filter item 5) ----
     @btn_save.clicked.connect
     def on_save():
         from . import data_io
@@ -1229,6 +1193,57 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
             show_error(str(exc))
 
     # ==================================================================
+    # HOTKEYS
+    # ==================================================================
+    # Single-key shortcuts for the most-used tools. overwrite=True makes them
+    # win even when napari binds the same key, so they always fire; each bind is
+    # guarded so an unrecognized key on an older napari never breaks startup.
+    # The napari Labels painting keys are left untouched: the number row (layer
+    # modes), "m" (new label) and the brush keys keep their napari meaning, so
+    # manual mask painting still works.
+    def _bind(key, fn):
+        def _cb(viewer, _fn=fn):
+            _fn()
+        try:
+            viewer.bind_key(key, _cb, overwrite=True)
+        except Exception:
+            pass
+
+    def _hk_flag(outcome, action):
+        finish(ops.apply_flag(state, id_a_input.value, outcome), action,
+               [id_a_input.value])
+
+    _bind("d", lambda: _hk_flag(OUTCOME_MITOSIS, "flag_mitosis"))   # division
+    _bind("w", lambda: _hk_flag(OUTCOME_EXIT, "flag_exit"))         # went off-field
+    _bind("k", lambda: _hk_flag(OUTCOME_DEATH, "flag_death"))       # killed
+    _bind("b", lambda: _hk_flag(OUTCOME_AMBIGUOUS, "flag_ambiguous"))
+    _bind("c", lambda: finish(ops.clear_flag(state, id_a_input.value),
+                              "flag_clear", [id_a_input.value]))     # clear
+
+    _bind("g", lambda: finish(
+        ops.merge(state, id_a_input.value, id_b_input.value),
+        "merge", [id_a_input.value, id_b_input.value]))             # glue A->B
+    _bind("s", lambda: finish(
+        ops.swap_future(state, id_a_input.value, id_b_input.value, current_frame()),
+        "swap_future", [id_a_input.value, id_b_input.value]))
+    _bind("Shift-S", lambda: finish(
+        ops.swap_local(state, id_a_input.value, id_b_input.value, current_frame()),
+        "swap_local", [id_a_input.value, id_b_input.value]))
+    _bind("n", lambda: finish(
+        ops.relabel_new(state, id_a_input.value), "relabel", [id_a_input.value]))
+    _bind("y", lambda: finish(
+        ops.sync_masks(state, [current_frame()], treatment_config), "sync_frame"))
+    _bind("l", lambda: finish(
+        ops.link_parent(state, id_a_input.value, id_b_input.value),
+        "link", [id_a_input.value, id_b_input.value]))
+
+    _bind("f", _focus)
+    _bind("Shift-F", _lineage_focus)
+    _bind(".", _next_unreviewed)
+    _bind(",", _skip)
+    _bind("Control-S", on_save)
+
+    # ==================================================================
     # PANELS
     # ==================================================================
     curation_panel = Container(widgets=[
@@ -1240,9 +1255,9 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         lbl_curation, btn_merge, btn_swap_future, btn_swap_local, btn_new_track,
         btn_sync_frame, btn_sync_all, btn_harmonize, btn_delete, btn_delete_track, btn_rescue, btn_autotrack,
         lbl_flags, btn_flag_mitosis, btn_flag_exit, btn_flag_death, btn_flag_ambiguous, btn_flag_clear,
-        lbl_lineage, btn_link_parent, btn_lineage_editor, btn_resequence_tree, btn_cut_ghosts, btn_tree_plot,
+        lbl_lineage, btn_link_parent, btn_resequence_tree, btn_cut_ghosts, btn_tree_plot,
         tree_max_families, tree_include_singles, btn_validate,
-        lbl_diag, btn_diagnose, btn_triage, btn_relink, btn_morph, btn_export_cell, btn_export_video, btn_save,
+        lbl_diag, btn_diagnose, btn_triage, btn_relink, btn_swaps, btn_morph, btn_export_cell, btn_export_video, btn_save,
     ])
 
     stats_panel = Container(widgets=[
