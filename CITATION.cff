@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Peranzoni"
+    given-names: "Níckolas Pippi"
+    orcid: "https://orcid.org/0009-0008-3312-7645"
+    affiliation: "Laboratório de Sinalização e Plasticidade Celular (LabSinal)"
+  - family-names: "Kraemer-Mattos"
+    given-names: "Frederico"
+    affiliation: "Laboratório de Sinalização e Plasticidade Celular (LabSinal)"
+  - family-names: "Lenz"
+    given-names: "Guido"
+    orcid: "https://orcid.org/0000-0003-4077-6316"
+    affiliation: "Laboratório de Sinalização e Plasticidade Celular (LabSinal)"
+title: "Napari-TRACE"
+version: 1.0.1
+doi: 10.5281/zenodo.20654096
+date-released: 2026-06-12
+url: "https://github.com/labsinal/napari-TRACE"

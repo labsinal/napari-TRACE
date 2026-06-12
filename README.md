@@ -1,5 +1,6 @@
 # Napari-TRACE
 ## Tracking Review and Correction Engine
+[![DOI](https://zenodo.org/badge/1264173831.svg)](https://doi.org/10.5281/zenodo.20653779)
 
 A [napari](https://napari.org)-based desktop tool for reviewing and correcting
 automated cell-tracking results from time-lapse microscopy. It overlays the raw
