@@ -3,7 +3,7 @@ napari UI assembly.
 
 Builds the viewer, layers, the curation panel, the statistics panel (with the
 customizable plots and the temporal-gradient scatter) and wires the navigable
-diagnostics panel (item 14) and the relink dialog (item 13).
+diagnostics panel and the relink dialog.
 
 All heavy logic is delegated to the tested core modules; this file is wiring
 and presentation only. It is imported only inside the napari environment.
@@ -29,11 +29,15 @@ from .config import (
     Thresholds,
 )
 from . import analysis, lineage, stats, curation_ops as ops, treatment as treat
+from . import exports
 from .audit import AuditLog
 from .review import LineageReview
+from .validated import CellValidation
+from .triage_review import TriageReview
 from .dialogs import TreatmentDialog
 from .tree_plot import lineage_tree_figure
-from .ui_panels import DiagnosticsDialog, RelinkDialog, TriageDialog, SwapDialog
+from .ui_panels import (DiagnosticsDialog, RelinkDialog, TriageDialog, SwapDialog,
+                        LineageEditorDialog, CompareCellDialog)
 from .validation_dialog import ValidationDialog
 from . import triage as triage_mod
 from . import validation as validation_mod
@@ -44,6 +48,8 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     """Construct and run the napari viewer around a CuratorState."""
     audit = AuditLog(work_dir)
     review = LineageReview(work_dir)
+    cellval = CellValidation(work_dir)
+    triage_review = TriageReview(work_dir)
     max_frame = int(state.df[COL_FRAME].dropna().max()) if not state.df.empty else 0
 
     viewer = napari.Viewer()
@@ -115,9 +121,9 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
             return
         if lineage_active["on"]:
             lineage_active.update(on=False, ids=set(), root=0)
-            btn_lineage_focus.text = "Lineage focus: OFF"
+            btn_lineage_focus.text = "Lineage focus: OFF  [Shift+F]"
         focus_active["on"] = True
-        btn_focus.text = f"Focus mode: ON (ID {int(track_id)})"
+        btn_focus.text = f"Focus mode: ON (ID {int(track_id)})  [f]"
         labels_layer.selected_label = int(track_id)
         _update_reviewed_button()
         update_visuals()
@@ -142,7 +148,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
             else:
                 df[COL_OUTCOME] = ""
 
-        for name in (LAYER_TRACKS, LAYER_IDS):
+        for name in (LAYER_IDS,):
             if name in viewer.layers:
                 viewer.layers.remove(name)
 
@@ -201,6 +207,8 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                     viewer.layers[LAYER_XRAY].visible = False
 
         if dv.empty:
+            if LAYER_TRACKS in viewer.layers:
+                viewer.layers.remove(LAYER_TRACKS)
             return
         dv = dv.sort_values([COL_TRACK, COL_FRAME])
         track_data = dv[[COL_TRACK, COL_FRAME, COL_Y, COL_X]].values
@@ -226,9 +234,22 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                 for d_id, m_id in daughters.items():
                     if int(m_id) in present_tracks:
                         graph[int(d_id)] = [int(m_id)]
-            viewer.add_tracks(track_data, name=LAYER_TRACKS, tail_width=2,
-                              tail_length=(SHORT_TAIL_LENGTH if not small_enough else 40),
-                              color_by="track_id", colormap="turbo", graph=graph)
+            tail = SHORT_TAIL_LENGTH if not small_enough else 40
+            if LAYER_TRACKS in viewer.layers:
+                # Update in place so the layer never disappears or loses its slot
+                # in the layer list (e.g. after exterminating a track).
+                tl = viewer.layers[LAYER_TRACKS]
+                tl.data = track_data
+                tl.graph = graph
+                tl.tail_length = tail
+                tl.visible = True
+            else:
+                viewer.add_tracks(track_data, name=LAYER_TRACKS, tail_width=2,
+                                  tail_length=tail,
+                                  color_by="track_id", colormap="turbo", graph=graph)
+        else:
+            if LAYER_TRACKS in viewer.layers:
+                viewer.layers.remove(LAYER_TRACKS)
 
         # ID labels. Drawing one text label per cell per frame is both illegible
         # and very slow once there are tens of thousands of them, which shows up
@@ -338,35 +359,36 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     lbl_setup = Label(value="--- SETUP ---")
     btn_treatment = PushButton(text="Set treatment / phases")
     lbl_view = Label(value="--- NAVIGATION & VIEW ---")
-    btn_focus = PushButton(text="Focus mode: OFF")
+    btn_focus = PushButton(text="Focus mode: OFF  [f]")
     btn_tracks = PushButton(text="Show tracks layer: AUTO")
-    btn_lineage_focus = PushButton(text="Lineage focus: OFF")
+    btn_lineage_focus = PushButton(text="Lineage focus: OFF  [Shift+F]")
     lineage_progress = Label(value="Lineages reviewed: -")
     btn_lineage_reviewed = PushButton(text="Mark this lineage as reviewed")
-    btn_next_unreviewed = PushButton(text="Jump to next unreviewed lineage")
-    btn_skip_single = PushButton(text="Jump to next cell without lineage")
+    btn_next_unreviewed = PushButton(text="Jump to next unreviewed lineage  [.]")
+    btn_skip_single = PushButton(text="Jump to next cell without lineage  [,]")
     btn_shuffle = PushButton(text="Shuffle colors")
-    btn_undo = PushButton(text="Undo (or press Ctrl+Z)")
+    btn_undo = PushButton(text="Undo  [Ctrl+Z]")
     lbl_curation = Label(value="--- BASIC CURATION ---")
-    btn_merge = PushButton(text="Merge (A becomes B across the movie)")
-    btn_swap_future = PushButton(text="Swap / cut (from here onward)")
-    btn_swap_local = PushButton(text="Local swap (this frame only)")
-    btn_new_track = PushButton(text="Relabel mask (new ID)")
-    btn_sync_frame = PushButton(text="Sync masks (this frame)")
+    btn_merge = PushButton(text="Merge (A becomes B across the movie)  [g]")
+    btn_swap_future = PushButton(text="Swap / cut (from here onward)  [s]")
+    btn_swap_local = PushButton(text="Local swap (this frame only)  [Shift+S]")
+    btn_new_track = PushButton(text="Relabel mask (new ID)  [n]")
+    btn_sync_frame = PushButton(text="Sync masks (this frame)  [y]")
     btn_sync_all = PushButton(text="Sync masks (whole movie)")
     btn_harmonize = PushButton(text="Harmonize colors")
-    btn_delete = PushButton(text="Delete cell [A] (this frame)")
+    btn_delete = PushButton(text="Delete cell [A] (this frame)  [x]")
     btn_delete_track = PushButton(text="Exterminate track [A] (whole movie)")
     btn_rescue = PushButton(text="Rescue orphan masks (assign new ID)")
     btn_autotrack = PushButton(text="Auto-tracking (ID [A] only)")
     lbl_flags = Label(value="--- OUTCOME FLAGS (on ID [A]) ---")
-    btn_flag_mitosis = PushButton(text="Mark: MITOSIS")
-    btn_flag_exit = PushButton(text="Mark: EXIT (left the field)")
-    btn_flag_death = PushButton(text="Mark: DEATH / SENESCENCE")
-    btn_flag_ambiguous = PushButton(text="Mark: AMBIGUOUS (unsure)")
-    btn_flag_clear = PushButton(text="Clear flags of ID [A]")
+    btn_flag_mitosis = PushButton(text="Mark: MITOSIS  [d]")
+    btn_flag_exit = PushButton(text="Mark: EXIT (left the field)  [w]")
+    btn_flag_death = PushButton(text="Mark: DEATH / SENESCENCE  [k]")
+    btn_flag_ambiguous = PushButton(text="Mark: AMBIGUOUS (unsure)  [b]")
+    btn_flag_clear = PushButton(text="Clear flags of ID [A]  [c]")
     lbl_lineage = Label(value="--- LINEAGE / GENEALOGY ---")
-    btn_link_parent = PushButton(text="Link mother [A] -> daughter [B]")
+    btn_link_parent = PushButton(text="Link mother [A] -> daughter [B]  [l]")
+    btn_lineage_editor = PushButton(text="Edit lineage of [A] (parent + daughters)")
     btn_resequence_tree = PushButton(text="Re-sequence tree (1 -> 11, 12)")
     btn_cut_ghosts = PushButton(text="Cut post-mitosis ghosts")
     btn_tree_plot = PushButton(text="Show lineage tree plot")
@@ -381,7 +403,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     btn_morph = PushButton(text="Detect segmentation errors (morphology)")
     btn_export_cell = PushButton(text="Export cell [A] video")
     btn_export_video = PushButton(text="Export presentation (screen)")
-    btn_save = PushButton(text="SAVE ALL (backup + atomic)")
+    btn_save = PushButton(text="SAVE ALL (backup + atomic)  [Ctrl+S]")
 
     # ---- setup ----
     @btn_treatment.clicked.connect
@@ -420,8 +442,66 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     # ---- lineage ----
     @btn_link_parent.clicked.connect
     def _link():
-        finish(ops.link_parent(state, id_a_input.value, id_b_input.value),
-               "link", [id_a_input.value, id_b_input.value])
+        a, b = id_a_input.value, id_b_input.value
+        res = ops.link_parent(state, a, b)
+        if getattr(res, "needs_confirm", False):
+            confirm = QMessageBox.question(
+                None, "Confirm lineage link", res.message,
+                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel)
+            if confirm != QMessageBox.Ok:
+                return show_info("Link cancelled.")
+            res = ops.link_parent(state, a, b, force=True)
+        finish(res, "link", [a, b])
+
+    def _ed_link(mother, daughter):
+        """Add/change a lineage link from the editor, honoring confirmation.
+
+        Mirrors the main Link button: runs link_parent, shows the same OK/Cancel
+        dialog when an override needs confirmation, then refreshes visuals and
+        audits without clearing the [A]/[B] inputs. Returns (ok, message) for the
+        editor's status line.
+        """
+        res = ops.link_parent(state, int(mother), int(daughter))
+        if getattr(res, "needs_confirm", False):
+            confirm = QMessageBox.question(
+                None, "Confirm lineage link", res.message,
+                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel)
+            if confirm != QMessageBox.Ok:
+                return False, "Link cancelled."
+            res = ops.link_parent(state, int(mother), int(daughter), force=True)
+        if res.ok:
+            update_visuals()
+            audit.record("link", ids=[int(mother), int(daughter)], detail=res.message)
+            _refresh_lineage_progress()
+            _update_reviewed_button()
+        else:
+            show_error(res.message)
+        return res.ok, res.message
+
+    def _ed_unlink(child):
+        """Detach a parent/daughter link from the editor; refresh + audit."""
+        res = ops.unlink_parent(state, int(child))
+        if res.ok:
+            update_visuals()
+            audit.record("unlink", ids=[int(child)], detail=res.message)
+            _refresh_lineage_progress()
+            _update_reviewed_button()
+        else:
+            show_error(res.message)
+        return res.ok, res.message
+
+    @btn_lineage_editor.clicked.connect
+    def _edit_lineage():
+        a = id_a_input.value
+        if a in (0, None) or int(a) <= 0:
+            return show_error("Put a cell ID in [A] first, then open the editor.")
+        if state.df[state.df[COL_TRACK] == int(a)].empty:
+            return show_error(f"Cell {int(a)} does not exist in the table.")
+        dlg = LineageEditorDialog(None, state, int(a), _ed_link, _ed_unlink, jump_to)
+        open_dialogs["lineage_editor"] = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     @btn_validate.clicked.connect
     def _validate():
@@ -494,17 +574,17 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
             if a == 0:
                 return show_error("Select ID [A] to focus.")
             focus_active["on"] = True
-            btn_focus.text = f"Focus mode: ON (ID {a})"
+            btn_focus.text = f"Focus mode: ON (ID {a})  [f]"
             labels_layer.selected_label = a
         else:
             focus_active["on"] = False
-            btn_focus.text = "Focus mode: OFF"
+            btn_focus.text = "Focus mode: OFF  [f]"
         update_visuals()
 
     @id_a_input.changed.connect
     def _id_a_changed(value):
         if focus_active["on"] and value > 0:
-            btn_focus.text = f"Focus mode: ON (ID {value})"
+            btn_focus.text = f"Focus mode: ON (ID {value})  [f]"
             labels_layer.selected_label = value
             update_visuals()
         # Keep the "mark reviewed" button label in sync with the selected cell's
@@ -551,14 +631,14 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
             # Turn off single-cell focus so the two modes don't fight.
             if focus_active["on"]:
                 focus_active["on"] = False
-                btn_focus.text = "Focus mode: OFF"
+                btn_focus.text = "Focus mode: OFF  [f]"
             n = len(fam)
-            btn_lineage_focus.text = f"Lineage focus: ON (root {root}, {n} cells)"
+            btn_lineage_focus.text = f"Lineage focus: ON (root {root}, {n} cells)  [Shift+F]"
             show_info(f"Lineage of {a}: root {root}, {n} cell(s) "
                       f"{'✓ reviewed' if review.is_reviewed(root) else 'not yet reviewed'}.")
         else:
             lineage_active.update(on=False, ids=set(), root=0)
-            btn_lineage_focus.text = "Lineage focus: OFF"
+            btn_lineage_focus.text = "Lineage focus: OFF  [Shift+F]"
         _update_reviewed_button()
         update_visuals()
 
@@ -608,7 +688,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         if lineage_active["on"]:
             lineage_active.update(ids=lineage.family_of(df, root), root=root)
             btn_lineage_focus.text = (f"Lineage focus: ON (root {root}, "
-                                      f"{len(lineage_active['ids'])} cells)")
+                                      f"{len(lineage_active['ids'])} cells)  [Shift+F]")
         jump_to(f0, tid0)
         _update_reviewed_button()
         show_info(f"Next unreviewed lineage: root {root} (cell {tid0}, frame {f0}). "
@@ -685,7 +765,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         finish(ops.autotrack(state, id_a_input.value, treatment_config),
                "autotrack", [id_a_input.value])
 
-    # ---- diagnostics (item 14) ----
+    # ---- diagnostics ----
     # Keep references to open dialogs so they are not garbage-collected
     # (a non-parented QDialog with no Python reference can vanish immediately).
     open_dialogs = {}
@@ -736,7 +816,8 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
             def _plot(sess):
                 stats.show(validation_mod.reliability_figure(sess))
 
-            dlg = ValidationDialog(None, state, session, jump_and_focus, _plot)
+            dlg = ValidationDialog(None, state, session, jump_and_focus, _plot,
+                                   validate_cb=lambda tid, ok: cellval.set(tid, ok))
             open_dialogs["validation"] = dlg
 
             def _hook(action, ids, detail):
@@ -752,7 +833,8 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                       f"Step through them one by one, fix what's wrong, tick OK, "
                       f"then plot the reliability.")
 
-        dlg = TriageDialog(None, state, res, jump_and_focus, _accept, _sample)
+        dlg = TriageDialog(None, state, res, jump_and_focus, _accept, _sample,
+                           triage_review=triage_review)
         open_dialogs["triage"] = dlg
         dlg.show(); dlg.raise_(); dlg.activateWindow()
 
@@ -859,7 +941,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         imageio.mimsave(path, frames, fps=10)
         show_info("Presentation exported.")
 
-    # ---- save (item 3 + unified anomaly filter item 5) ----
+    # ---- save (backup + unified anomaly filter) ----
     @btn_save.clicked.connect
     def on_save():
         from . import data_io
@@ -943,6 +1025,31 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         update_visuals()
         viewer.dims.current_step = current
         show_info(f"Saved. Backup at: {bdir}")
+
+        # Derived export tables (full + validated copies). Best-effort: the core
+        # save already succeeded, so a failure here never loses curation work.
+        try:
+            import os
+            existing = set(state.df[COL_TRACK].dropna().astype(int).unique())
+            cellval.prune(existing)
+            triage_review.prune(existing)
+            review.prune(lineage.lineage_roots(state.df))
+            base = os.path.splitext(os.path.basename(csv_path))[0]
+            res = exports.write_all(
+                work_dir, state.df, state.mask,
+                reviewed_roots=review.reviewed_roots(),
+                validated_cells=cellval.ids(),
+                base_name=base, window=int(export_window.value),
+                pixel_size=pixel_size_input.value,
+                frame_interval=frame_interval_input.value)
+            audit.record("export_tables",
+                         detail=f"{len(res['files'])} tables, "
+                                f"{res['n_validated_tracks']} validated tracks -> {res['dir']}")
+            show_info(f"Exported {len(res['files'])} tables "
+                      f"({res['n_validated_tracks']} validated tracks) to {res['dir']}.")
+        except Exception as exc:
+            show_error(f"Main save OK, but export tables failed: {exc}")
+
         clear_inputs()
 
     # ==================================================================
@@ -952,6 +1059,9 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     pixel_size_input = FloatSpinBox(label="Pixel size (um/px):", value=1.0, min=0.0001, step=0.05)
     frame_interval_input = FloatSpinBox(label="Frame interval (min/frame):", value=1.0, min=0.0001, step=0.5)
     exclude_border_cb = CheckBox(label="Exclude border-touching points", value=False)
+    export_window = SpinBox(label="Window for accumulated export:", value=7, min=2, max=1000)
+    btn_nma = PushButton(text="Plot NMA (Area vs NII, per cell-frame)")
+    btn_compare = PushButton(text="Compare cell [A] vs dataset (by group)")
 
     btn_stats_lifetime = PushButton(text="Lifetime (treated vs control, mitotic vs not)")
     btn_stats_migration = PushButton(text="Migration (speed, displacement, directionality)")
@@ -989,7 +1099,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                      if pd.api.types.is_numeric_dtype(state.df[c])
                      and c not in (COL_TRACK, COL_FRAME)]
     _traj_ts_cols = (["area_px"] if "area_px" not in _traj_ts_cols else []) + _traj_ts_cols
-    _traj_ts_cols += ["perimeter", "circularity"]
+    _traj_ts_cols += ["perimeter", "circularity"] + list(analysis.NMA_COLS)
     traj_y = ComboBox(label="Quantity (Y):", choices=_traj_ts_cols,
                       value=_traj_ts_cols[0])
     traj_window_kind = ComboBox(label="Window metric:",
@@ -1150,6 +1260,35 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         except Exception as exc:
             show_error(str(exc))
 
+    @btn_nma.clicked.connect
+    def _nma():
+        try:
+            fig = stats.nma_scatter(
+                stats_df(), state.mask,
+                pixel_size=pixel_size_input.value,
+                treatment_config=treatment_config)
+            stats.show(fig)
+        except Exception as exc:
+            show_error(str(exc))
+
+    @btn_compare.clicked.connect
+    def _compare():
+        a = id_a_input.value
+        if a in (0, None) or int(a) <= 0:
+            return show_error("Put a cell ID in [A] first.")
+        try:
+            pages = stats.compare_cell_pages(
+                stats_df(), state.mask, int(a),
+                pixel_size=pixel_size_input.value,
+                frame_interval=frame_interval_input.value)
+        except Exception as exc:
+            return show_error(str(exc))
+        dlg = CompareCellDialog(None, int(a), pages)
+        open_dialogs["compare"] = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
     @btn_traj.clicked.connect
     def _traj():
         mode = traj_mode.value
@@ -1233,9 +1372,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         ops.relabel_new(state, id_a_input.value), "relabel", [id_a_input.value]))
     _bind("y", lambda: finish(
         ops.sync_masks(state, [current_frame()], treatment_config), "sync_frame"))
-    _bind("l", lambda: finish(
-        ops.link_parent(state, id_a_input.value, id_b_input.value),
-        "link", [id_a_input.value, id_b_input.value]))
+    _bind("l", _link)
 
     _bind("f", _focus)
     _bind("Shift-F", _lineage_focus)
@@ -1255,13 +1392,14 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         lbl_curation, btn_merge, btn_swap_future, btn_swap_local, btn_new_track,
         btn_sync_frame, btn_sync_all, btn_harmonize, btn_delete, btn_delete_track, btn_rescue, btn_autotrack,
         lbl_flags, btn_flag_mitosis, btn_flag_exit, btn_flag_death, btn_flag_ambiguous, btn_flag_clear,
-        lbl_lineage, btn_link_parent, btn_resequence_tree, btn_cut_ghosts, btn_tree_plot,
+        lbl_lineage, btn_link_parent, btn_lineage_editor, btn_resequence_tree, btn_cut_ghosts, btn_tree_plot,
         tree_max_families, tree_include_singles, btn_validate,
         lbl_diag, btn_diagnose, btn_triage, btn_relink, btn_swaps, btn_morph, btn_export_cell, btn_export_video, btn_save,
     ])
 
     stats_panel = Container(widgets=[
         lbl_stats, pixel_size_input, frame_interval_input, exclude_border_cb,
+        export_window, btn_nma, btn_compare,
         btn_stats_lifetime, btn_stats_migration, btn_stats_motility, btn_stats_area, btn_stats_growth,
         btn_stats_outcomes, btn_stats_division, btn_stats_msd, btn_stats_export,
         lbl_gradient, gradient_value, gradient_group, btn_gradient,

@@ -87,11 +87,11 @@ def shade_treatment(ax, treatment_config, max_frame):
 # ---------------------------------------------------------------------------
 # Human-readable names for the categorical grouping keys, used on the X axis.
 _GRADIENT_GROUP_LABELS = {
-    "final_outcome": "Desfecho",
-    "outcome": "Desfecho",
-    "treatment": "Tratamento",
-    "is_mitotic": "Mitótica?",
-    "time": "Janela de tempo",
+    "final_outcome": "Outcome",
+    "outcome": "Outcome",
+    "treatment": "Treatment",
+    "is_mitotic": "Mitotic?",
+    "time": "Time window",
 }
 
 
@@ -112,11 +112,10 @@ def _group_for_cellframe(df, group_by):
 
     if group_by in ("final_outcome", "outcome"):
         per_track = _final_outcome_per_track(d)
-        # Use the Portuguese outcome labels (Mitose / Fim / ...) to match the
-        # rest of the figures; unknown/none stays "Sem desfecho".
+        # Group by each track's final outcome; unknown/none stays "No outcome".
         for f, t in zip(d[COL_FRAME], d[COL_TRACK]):
             oc = per_track.get(int(t), "none")
-            lookup[(int(f), int(t))] = TRAJ_OUTCOME_LABELS.get(oc, "Sem desfecho")
+            lookup[(int(f), int(t))] = TRAJ_OUTCOME_LABELS.get(oc, "No outcome")
     elif group_by == "is_mitotic":
         mothers = set()
         if COL_PARENT in d.columns:
@@ -126,7 +125,7 @@ def _group_for_cellframe(df, group_by):
         for f, t in zip(d[COL_FRAME], d[COL_TRACK]):
             ti = int(t)
             is_mito = ti in mothers or per_track.get(ti) == "Mitosis"
-            lookup[(int(f), ti)] = "Mitótica" if is_mito else "Não-mitótica"
+            lookup[(int(f), ti)] = "Mitotic" if is_mito else "Non-mitotic"
     elif group_by == "treatment":
         col = d[COL_TREATMENT] if COL_TREATMENT in d.columns else None
         for i, (f, t) in enumerate(zip(d[COL_FRAME], d[COL_TRACK])):
@@ -165,7 +164,7 @@ def gradient_over_time(df, mask, value="area", pixel_size=1.0, frame_interval=1.
 
     if value == "area":
         if mask is None:
-            raise ValueError("O gradiente de área precisa de uma máscara.")
+            raise ValueError("The area gradient needs a mask.")
         px_area = pixel_size ** 2
         for f in range(mask.shape[0]):
             for idv, ar in analysis.areas_for_frame(mask[f], px_area).items():
@@ -173,21 +172,21 @@ def gradient_over_time(df, mask, value="area", pixel_size=1.0, frame_interval=1.
                 vals_all.append(ar)
                 if not is_time:
                     groups_all.append(group_lookup.get((int(f), int(idv)),
-                                                        "Sem desfecho"))
-        ylabel = f"Área ({'µm²' if pixel_size != 1.0 else 'px²'})"
+                                                        "No outcome"))
+        ylabel = f"Area ({'µm²' if pixel_size != 1.0 else 'px²'})"
     else:
         if value not in df.columns:
-            raise ValueError(f"Coluna '{value}' não está na tabela.")
+            raise ValueError(f"Column '{value}' is not in the table.")
         d = df.dropna(subset=[COL_FRAME, value, COL_TRACK])
         frames_all = d[COL_FRAME].to_numpy(dtype=float).tolist()
         vals_all = d[value].to_numpy(dtype=float).tolist()
         if not is_time:
             for f, t in zip(d[COL_FRAME], d[COL_TRACK]):
-                groups_all.append(group_lookup.get((int(f), int(t)), "Sem desfecho"))
-        ylabel = value
+                groups_all.append(group_lookup.get((int(f), int(t)), "No outcome"))
+        ylabel = pretty(value)
 
     if not frames_all:
-        raise ValueError("Nenhum dado para plotar.")
+        raise ValueError("No data to plot.")
 
     frames_all = np.asarray(frames_all, dtype=float)
     vals_all = np.asarray(vals_all, dtype=float)
@@ -207,11 +206,11 @@ def gradient_over_time(df, mask, value="area", pixel_size=1.0, frame_interval=1.
         present = set(groups_all)
         # Order the boxes sensibly per grouping; unknown labels go last.
         if group_by in ("final_outcome", "outcome"):
-            preferred = ["Mitose", "Fim", "Morte/Senescência", "Ambíguo", "Sem desfecho"]
+            preferred = ["Mitosis", "Exit", "Death/Senescence", "Ambiguous", "No outcome"]
         elif group_by == "treatment":
             preferred = [TREAT_CONTROL, TREAT_TREATED, TREAT_WASHOUT]
         elif group_by == "is_mitotic":
-            preferred = ["Mitótica", "Não-mitótica"]
+            preferred = ["Mitotic", "Non-mitotic"]
         else:
             preferred = []
         box_labels = [g for g in preferred if g in present]
@@ -251,13 +250,13 @@ def gradient_over_time(df, mask, value="area", pixel_size=1.0, frame_interval=1.
     sm = cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax)
-    cbar.set_label("Frame (azul = início, vermelho = fim)")
+    cbar.set_label("Frame (blue = early, red = late)")
     ax.set_xticks(positions)
     ax.set_xticklabels([f"{l}\n(n={d.size})" for l, d in zip(box_labels, box_data)],
                        fontsize=8)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    ax.set_title(f"{ylabel}: boxplot por {xlabel.lower()} com gradiente temporal",
+    ax.set_title(f"{ylabel} by {xlabel.lower()} with temporal gradient",
                  fontweight="bold")
     ax.grid(axis="y", alpha=0.3)
     return fig
@@ -342,12 +341,39 @@ TRAJ_OUTCOME_COLORS = {
     "Ambiguous": "#E0A030",
 }
 TRAJ_OUTCOME_LABELS = {
-    "Mitosis": "Mitose",
-    "Exit": "Fim",
-    "Death/Senescence": "Morte/Senescência",
-    "Ambiguous": "Ambíguo",
+    "Mitosis": "Mitosis",
+    "Exit": "Exit",
+    "Death/Senescence": "Death/Senescence",
+    "Ambiguous": "Ambiguous",
 }
 _TRAJ_DEFAULT_COLOR = "#9E9E9E"
+
+
+# Human-readable titles/axis labels for the quantities the plots expose.
+PRETTY_LABELS = {
+    "area_px": "Area (px²)",
+    "perimeter": "Perimeter (px)",
+    "circularity": "Circularity",
+    "aspect": "Aspect",
+    "area_box": "Area / Box",
+    "radius_ratio": "Radius Ratio",
+    "roundness": "Roundness",
+    "nii": "Nuclear Irregularity Index",
+    "speed": "Speed",
+    "cum_distance": "Cumulative Distance",
+    "abs_displacement": "Linear Displacement",
+    "net_disp": "Net Displacement",
+    "step_disp": "Step Displacement",
+}
+
+
+def pretty(col):
+    """Pretty, English display name for a quantity column."""
+    if not col:
+        return ""
+    if col in PRETTY_LABELS:
+        return PRETTY_LABELS[col]
+    return str(col).replace("_", " ").title()
 
 
 def _final_outcome_per_track(df):
@@ -436,13 +462,18 @@ def _rolling(values, win, stat):
 
 # Window-mode catalogue: label -> (stat, needs_xy, ylabel, title).
 WINDOW_MODES = {
-    "persistence": ("persistence", True, "Persistência", "Persistência Migratória Local"),
-    "area_cv": ("cv", False, "Variação (CV)", "Instabilidade do Envelope Nuclear (CV)"),
-    "area_slope": ("slope", False, "Slope (Tendência)", "Taxa de Expansão/Retração (Slope)"),
-    "path": ("path", True, "Distância Caminhada", "Esforço Motor na Janela"),
-    "net": ("net", True, "Deslocamento Reto", "Eficácia de Migração na Janela"),
-    "speed_mean": ("mean", False, "Velocidade Média", "Velocidade Média por Blocos Temporais"),
+    "persistence": ("persistence", True, "Persistence", "Local Migratory Persistence"),
+    "area_cv": ("cv", False, "Area Variation (CV)", "Nuclear Envelope Instability (CV)"),
+    "area_slope": ("slope", False, "Area Slope (trend)", "Expansion / Retraction Rate (slope)"),
+    "path": ("path", True, "Path Length", "Motor Effort in Window"),
+    "net": ("net", True, "Net Displacement", "Migration Efficacy in Window"),
+    "speed_mean": ("mean", False, "Mean Speed", "Mean Speed per Time Window"),
+    "nii_mean": ("mean", False, "Nuclear Irregularity Index", "NII — Local Mean in Window"),
+    "nii_cv": ("cv", False, "NII Variation (CV)", "NII Variability in Window"),
+    "nii_slope": ("slope", False, "NII Trend (slope)", "NII Trend in Window"),
 }
+# Window modes whose series is the per-frame NII (needs the mask).
+_NII_WINDOW_MODES = {"nii_mean", "nii_cv", "nii_slope"}
 
 
 def trajectories(df, mask=None, mode="timeseries", y_col=None,
@@ -460,7 +491,7 @@ def trajectories(df, mask=None, mode="timeseries", y_col=None,
         along each track (the odometer / distance-travelled plot). If
         ``y_col`` is None, uses per-step euclidean displacement from x/y.
       * ``"spider"``     : x/y trajectory translated so each track starts at the
-        origin (deslocamento X vs Y).
+        origin (X vs Y displacement).
       * ``"window"``     : a centered rolling-window statistic (see
         ``WINDOW_MODES``) selected through ``y_col`` being one of its keys.
 
@@ -476,16 +507,34 @@ def trajectories(df, mask=None, mode="timeseries", y_col=None,
     d[COL_TRACK] = d[COL_TRACK].astype(int)
     d = d[d[COL_TRACK] > 0].sort_values([COL_TRACK, COL_FRAME])
 
-    # For perimeter/circularity (not in the per-frame table) merge them from the
-    # mask on demand. Area uses COL_AREA if present, else from the mask too.
-    if mode in ("timeseries",) and y_col in ("perimeter", "circularity"):
-        morph = analysis.morphology_timeseries(mask)
-        if morph.empty:
-            raise ValueError("Perimeter/circularity need a mask.")
-        d = d.merge(morph[["frame", "track_id", y_col]],
-                    on=["frame", "track_id"], how="left")
-    if mode in ("timeseries",) and y_col == "area_px" and "area_px" not in d.columns:
-        d = analysis.annotate_area(d, mask)
+    # Ensure a requested derived per-frame column is present, merging it from
+    # the mask on demand (perimeter/circularity, the NII morphometry columns,
+    # area_px). Works for every mode, so cumulative/window can use them too.
+    def _ensure_col(col):
+        nonlocal d
+        if not col or col in d.columns:
+            return
+        if col in ("perimeter", "circularity"):
+            src = analysis.morphology_timeseries(mask)
+            if src.empty:
+                raise ValueError("Perimeter/circularity need a mask.")
+            d = d.merge(src[["frame", "track_id", col]],
+                        on=["frame", "track_id"], how="left")
+        elif col in analysis.NMA_COLS:
+            src = analysis.nuclear_morphometry(mask)
+            if src.empty:
+                raise ValueError("Nuclear morphometry (NII) needs a mask.")
+            d = d.merge(src[["frame", "track_id", col]],
+                        on=["frame", "track_id"], how="left")
+        elif col == "area_px":
+            d = analysis.annotate_area(d, mask)
+
+    if mode in ("timeseries", "cumulative") and y_col:
+        _ensure_col(y_col)
+    if mode == "window" and y_col in _NII_WINDOW_MODES:
+        _ensure_col("nii")
+    if mode == "window" and y_col in ("area_cv", "area_slope"):
+        _ensure_col("area_px")
 
     outcomes = _final_outcome_per_track(d)
 
@@ -540,6 +589,10 @@ def trajectories(df, mask=None, mode="timeseries", y_col=None,
                 if y_col == "speed_mean":
                     series = np.sqrt(np.diff(xs, prepend=xs[0]) ** 2 +
                                      np.diff(ys, prepend=ys[0]) ** 2) / frame_interval
+                elif y_col in _NII_WINDOW_MODES:
+                    if "nii" not in g.columns:
+                        raise ValueError("NII window needs a mask.")
+                    series = g["nii"].to_numpy(dtype=float)
                 else:  # area-based windows
                     if "area_px" in g.columns:
                         series = g["area_px"].to_numpy(dtype=float)
@@ -582,371 +635,259 @@ def trajectories(df, mask=None, mode="timeseries", y_col=None,
     if band is not None:
         handles.append(band)
     if handles:
-        ax.legend(handles=handles, title="Identificação", loc="upper right",
+        ax.legend(handles=handles, title="Outcome", loc="upper right",
                   fontsize=9, framealpha=0.9)
 
     # Axis labels and title per mode.
     if mode == "spider":
-        ax.set_xlabel("Deslocamento X")
-        ax.set_ylabel("Deslocamento Y")
-        ax.set_title(title or "Spider Plot Global", fontweight="bold")
+        ax.set_xlabel("X displacement")
+        ax.set_ylabel("Y displacement")
+        ax.set_title(title or "Spider plot (all tracks)", fontweight="bold")
         ax.set_aspect("equal", adjustable="datalim")
     else:
-        tu = "Frame" if frame_interval == 1.0 else "min"
+        tu = "frame" if frame_interval == 1.0 else "min"
         if is_window:
-            ax.set_xlabel(f"Centro da Janela ({tu} Absoluto)")
+            ax.set_xlabel(f"Window centre ({tu})")
             ax.set_ylabel(ylabel or win_ylabel)
             ax.set_title(title or win_title, fontweight="bold")
         elif mode == "cumulative":
-            ax.set_xlabel(f"Tempo Absoluto ({tu} do Microscópio)")
-            ax.set_ylabel(ylabel or "Distância Acumulada")
-            ax.set_title(title or "Odômetro: Distância Total Percorrida", fontweight="bold")
+            ax.set_xlabel(f"Time ({tu})")
+            if y_col:
+                ax.set_ylabel(ylabel or f"Cumulative change in {pretty(y_col)}")
+                ax.set_title(title or f"Accumulated change — {pretty(y_col)}",
+                             fontweight="bold")
+            else:
+                ax.set_ylabel(ylabel or "Cumulative distance")
+                ax.set_title(title or "Total distance travelled (odometer)",
+                             fontweight="bold")
         else:
-            ax.set_xlabel(f"Tempo Absoluto ({tu} do Microscópio)")
-            ax.set_ylabel(ylabel or (y_col or "Valor"))
-            ax.set_title(title or (y_col or "Trajetórias"), fontweight="bold")
+            ax.set_xlabel(f"Time ({tu})")
+            ax.set_ylabel(ylabel or pretty(y_col) or "Value")
+            ax.set_title(title or pretty(y_col) or "Trajectories", fontweight="bold")
     ax.grid(alpha=0.3)
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Single-cell vs population / groups: does one cell stand out as an outlier?
+# Compare one cell against the rest of the dataset, by group (paginated)
 # ---------------------------------------------------------------------------
-# Metrics from the per-track summary worth comparing, with display labels. Only
-# those actually present (and numeric) in a given summary are used.
-COMPARE_METRICS = {
-    "lifetime": "Tempo de vida",
-    "mean_speed": "Velocidade média",
-    "net_displacement": "Deslocamento líquido",
-    "total_distance": "Distância total",
-    "directionality": "Direcionalidade",
-    "confinement_ratio": "Razão de confinamento",
-    "diffusion_coeff": "Coef. de difusão",
-    "persistence_time": "Tempo de persistência",
-    "mean_turning_angle": "Ângulo de giro médio",
-    "mean_area": "Área média",
-    "max_area": "Área máxima",
+# (metric column in the per-track summary, pretty page title)
+COMPARE_METRICS = [
+    ("lifetime", "Lifetime"),
+    ("total_distance", "Total Distance"),
+    ("net_displacement", "Net Displacement"),
+    ("mean_speed", "Mean Speed"),
+    ("directionality", "Directionality"),
+    ("confinement_ratio", "Confinement Ratio"),
+    ("persistence_time", "Persistence Time"),
+    ("mean_turning_angle", "Mean Turning Angle"),
+    ("diffusion_coeff", "Diffusion Coefficient"),
+    ("mean_area", "Mean Area"),
+    ("max_area", "Max Area"),
+    ("mean_nii", "Nuclear Irregularity Index (mean)"),
+    ("mean_aspect", "Aspect (mean)"),
+    ("mean_roundness", "Roundness (mean)"),
+    ("mean_circularity", "Circularity (mean)"),
+    ("mean_radius_ratio", "Radius Ratio (mean)"),
+    ("mean_area_box", "Area / Box (mean)"),
+    ("mean_perimeter", "Perimeter (mean)"),
+]
+
+_GROUP_PALETTE = {
+    "All cells": "#9E9E9E",
+    "Mitotic": GROUP_COLORS["mitotic"],
+    "Non-mitotic": GROUP_COLORS["non-mitotic"],
+    "Control": GROUP_COLORS[TREAT_CONTROL],
+    "Treated": GROUP_COLORS[TREAT_TREATED],
+    "Washout": GROUP_COLORS[TREAT_WASHOUT],
 }
-
-# Robust z above which a cell is called an outlier for a given metric. z is
-# |value - median| / (1.4826*MAD): ~2 ≈ 95th percentile of a normal, 3 ≈ 99.7th.
-OUTLIER_Z = 3.0
-
-# Short X-tick labels so long group names (e.g. "desfecho: Morte/Senescência")
-# don't overflow into the subplot below. Keys match _grouping_sets() labels;
-# anything not listed is shortened generically (prefix dropped, truncated).
-_GROUP_SHORT = {
-    "mitóticas": "mitót.",
-    "não-mitóticas": "n-mitót.",
-    TREAT_CONTROL: "control",
-    TREAT_TREATED: "treated",
-    TREAT_WASHOUT: "washout",
-}
-
-
-def _short_group_label(name):
-    """Compact a (possibly long) group label for an X tick."""
-    if name in _GROUP_SHORT:
-        return _GROUP_SHORT[name]
-    s = str(name)
-    if s.startswith("desfecho: "):
-        s = s[len("desfecho: "):]
-    # Common outcome names that are still long.
-    s = s.replace("Morte/Senescência", "Morte/Sen.")
-    return s if len(s) <= 12 else s[:11] + "…"
 
 
 def _robust_z(value, arr):
-    """Robust z-score of ``value`` against the distribution ``arr``.
-
-    z = |value - median| / (1.4826 * MAD). Returns (z, median, scale) or
-    (nan, median, nan) when the spread is degenerate / the sample too small.
-    The MAD-based scale is resistant to the very outliers we are hunting for,
-    unlike mean+std which an extreme cell would inflate and so hide itself.
-    """
-    a = np.asarray(arr, dtype=float)
-    a = a[np.isfinite(a)]
-    if a.size < 3 or value is None or not np.isfinite(value):
-        return np.nan, (float(np.median(a)) if a.size else np.nan), np.nan
-    med = float(np.median(a))
-    scale = 1.4826 * float(np.median(np.abs(a - med)))
-    if scale <= 1e-12:
-        scale = float(np.std(a))
-    if scale <= 1e-12:
-        return np.nan, med, np.nan
-    return abs(float(value) - med) / scale, med, scale
+    """Robust z = (value - median) / (1.4826 * MAD); falls back to mean/std."""
+    arr = np.asarray(arr, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 3 or not np.isfinite(value):
+        return np.nan
+    med = np.median(arr)
+    mad = np.median(np.abs(arr - med))
+    if mad > 0:
+        return float((value - med) / (1.4826 * mad))
+    std = arr.std()
+    return float((value - arr.mean()) / std) if std > 0 else np.nan
 
 
-def _grouping_sets(summary):
-    """Return {group_label: boolean mask into summary} for the natural groups.
+def _compare_groups(summary, df):
+    """Return an ordered dict {group_name: boolean mask over summary rows}."""
+    tid = summary["track_id"].astype(int)
+    outcomes = _final_outcome_per_track(df)
+    mothers = set()
+    if COL_PARENT in df.columns:
+        mothers = set(int(p) for p in df.loc[df[COL_PARENT] > 0, COL_PARENT]
+                      .dropna().unique())
 
-    Always includes mitotic vs non-mitotic. Adds one mask per treatment phase
-    and one per final outcome that is actually present, so the user gets exactly
-    the comparison they asked for ('cell 40 vs mitotic vs non-mitotic vs control').
-    """
-    groups = {}
-    if "is_mitotic" in summary.columns:
-        groups["mitóticas"] = summary["is_mitotic"].astype(bool).to_numpy()
-        groups["não-mitóticas"] = ~summary["is_mitotic"].astype(bool).to_numpy()
-    if "treatment" in summary.columns:
-        for t in sorted(str(x) for x in summary["treatment"].dropna().unique()):
-            groups[t] = (summary["treatment"].astype(str) == t).to_numpy()
-    if "final_outcome" in summary.columns:
-        for oc in sorted(str(x) for x in summary["final_outcome"].dropna().unique()):
-            if oc in ("", "none", "nan", "None"):
-                continue
-            label = TRAJ_OUTCOME_LABELS.get(oc, oc)
-            groups[f"desfecho: {label}"] = (summary["final_outcome"].astype(str) == oc).to_numpy()
+    def is_mito(t):
+        return int(t) in mothers or outcomes.get(int(t)) == "Mitosis"
+
+    mito_mask = tid.map(is_mito).to_numpy()
+    groups = {
+        "All cells": np.ones(len(summary), dtype=bool),
+        "Mitotic": mito_mask,
+        "Non-mitotic": ~mito_mask,
+    }
+    if COL_TREATMENT in df.columns:
+        treat_map = (df.dropna(subset=[COL_TRACK])
+                     .groupby(df[COL_TRACK].astype(int))[COL_TREATMENT].first().to_dict())
+        for name, val in (("Control", TREAT_CONTROL), ("Treated", TREAT_TREATED),
+                          ("Washout", TREAT_WASHOUT)):
+            mask = tid.map(lambda t: treat_map.get(int(t)) == val).to_numpy()
+            if mask.any():
+                groups[name] = mask
     return groups
 
 
-def compare_cell(summary, track_id, metrics=None, outlier_z=OUTLIER_Z):
-    """Compare one cell to the whole dataset and to each natural group.
-
-    Returns a dict:
-      {
-        "track_id": int,
-        "found": bool,
-        "metrics": {metric: {
-            "label": str, "value": float,
-            "all":   {"z","median","scale","n","is_outlier"},
-            "groups": {group_label: {"z","median","scale","n","is_outlier","in_group"}},
-        }},
-        "outlier_metrics": [metric, ...],   # metrics where it's an outlier vs ALL
-      }
-
-    "vs ALL" uses every other track (the cell itself is excluded from the
-    reference distribution so it can't mask its own deviation). "vs group" uses
-    the other members of that group. A cell is flagged an outlier on a metric
-    when its robust z exceeds ``outlier_z`` against the dataset.
-    """
-    out = {"track_id": int(track_id), "found": False, "metrics": {},
-           "outlier_metrics": []}
-    if summary is None or summary.empty or "track_id" not in summary.columns:
-        return out
-    row = summary[summary["track_id"].astype(int) == int(track_id)]
-    if row.empty:
-        return out
-    out["found"] = True
-    row = row.iloc[0]
-
-    avail = metrics or [m for m in COMPARE_METRICS
-                        if m in summary.columns
-                        and pd.api.types.is_numeric_dtype(summary[m])]
-    groups = _grouping_sets(summary)
-    self_mask = (summary["track_id"].astype(int) == int(track_id)).to_numpy()
-
-    for m in avail:
-        value = row.get(m)
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            value = np.nan
-        col = summary[m].to_numpy(dtype=float)
-
-        # vs ALL other cells (exclude self from the reference distribution).
-        others = col[~self_mask]
-        z_all, med_all, sc_all = _robust_z(value, others)
-        is_out_all = bool(np.isfinite(z_all) and z_all > outlier_z)
-        entry = {
-            "label": COMPARE_METRICS.get(m, m),
-            "value": value,
-            "all": {"z": z_all, "median": med_all, "scale": sc_all,
-                    "n": int(np.isfinite(others).sum()), "is_outlier": is_out_all},
-            "groups": {},
-        }
-        for gname, gmask in groups.items():
-            in_group = bool(gmask[self_mask][0]) if self_mask.any() else False
-            ref = col[gmask & ~self_mask]
-            z_g, med_g, sc_g = _robust_z(value, ref)
-            entry["groups"][gname] = {
-                "z": z_g, "median": med_g, "scale": sc_g,
-                "n": int(np.isfinite(ref).sum()),
-                "is_outlier": bool(np.isfinite(z_g) and z_g > outlier_z),
-                "in_group": in_group,
-            }
-        out["metrics"][m] = entry
-        if is_out_all:
-            out["outlier_metrics"].append(m)
-    return out
-
-
-def compare_cell_text(comparison):
-    """Human-readable summary of compare_cell() for the notifications / console."""
-    tid = comparison.get("track_id")
-    if not comparison.get("found"):
-        return f"Célula {tid} não está no resumo por-track (sem trajetória válida?)."
-    n_out = len(comparison["outlier_metrics"])
-    if n_out == 0:
-        head = f"Célula {tid}: dentro do normal em todas as métricas (nenhum outlier vs dataset)."
-    else:
-        labs = ", ".join(comparison["metrics"][m]["label"]
-                         for m in comparison["outlier_metrics"])
-        head = (f"Célula {tid}: destaca-se como OUTLIER em {n_out} "
-                f"métrica(s) vs dataset — {labs}.")
-    lines = [head]
-    for m, e in comparison["metrics"].items():
-        z = e["all"]["z"]
-        zt = "n/d" if not np.isfinite(z) else f"{z:.1f}σ"
-        mark = "  <-- OUTLIER" if e["all"]["is_outlier"] else ""
-        med = e["all"]["median"]
-        lines.append(
-            f"  {e['label']}: {e['value']:.2f} "
-            f"(mediana dataset {med:.2f}, z={zt}){mark}")
-    return "\n".join(lines)
-
-
-def _draw_compare_axis(ax, summary, comp, m, track_id, groups, self_mask):
-    """Draw ONE metric's comparison on ``ax``: violin + slim box per group + star.
-
-    With thousands of cells a point cloud collapses into a solid black smear
-    that hides the target, so the distribution is shown purely as a violin
-    (density shape) plus a slim boxplot for the quartiles/median. The target
-    cell is a red star on the dataset and on each group it belongs to.
-    """
-    e = comp["metrics"][m]
-    col = summary[m].to_numpy(dtype=float)
-
-    labels, data, colors = ["dataset"], [col[np.isfinite(col)]], ["#B0BEC5"]
+def _compare_metric_figure(label, values, groups, target_value, target_id):
+    """One page: per-group violin/density of a metric with the cell marked."""
+    fig, ax = plt.subplots(figsize=(9, 6))
+    names, data, colors, ztexts = [], [], [], []
     for gname, gmask in groups.items():
-        ref = col[gmask]
-        ref = ref[np.isfinite(ref)]
-        if ref.size:
-            labels.append(gname)
-            data.append(ref)
-            colors.append(GROUP_COLORS.get(gname, "#9E9E9E"))
+        v = values[gmask]
+        v = v[np.isfinite(v)]
+        if v.size < 2:
+            continue
+        names.append(gname)
+        data.append(v)
+        colors.append(_GROUP_PALETTE.get(gname, "#9E9E9E"))
+        z = _robust_z(target_value, v)
+        ztexts.append("Z=n/a" if not np.isfinite(z) else f"Z={z:+.1f}")
 
-    positions = list(range(1, len(labels) + 1))
+    if not data:
+        ax.text(0.5, 0.5, "Not enough data for this metric.",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(label, fontweight="bold")
+        return fig
 
-    # Violin (density). A single-member or zero-spread group can't form a
-    # violin, so those simply show their boxplot/median line instead.
-    vparts_idx = [i for i, d in enumerate(data) if d.size >= 2 and np.ptp(d) > 0]
-    if vparts_idx:
-        vp = ax.violinplot([data[i] for i in vparts_idx],
-                           positions=[positions[i] for i in vparts_idx],
-                           widths=0.8, showmeans=False, showmedians=False,
-                           showextrema=False)
-        for body, i in zip(vp["bodies"], vparts_idx):
-            body.set_facecolor(colors[i])
-            body.set_alpha(0.45)
-            body.set_edgecolor("#555555")
-            body.set_linewidth(0.6)
+    pos = list(range(1, len(data) + 1))
+    parts = ax.violinplot(data, positions=pos, widths=0.8, showmedians=True,
+                          showextrema=False)
+    for body, col in zip(parts["bodies"], colors):
+        body.set_facecolor(col)
+        body.set_alpha(0.55)
+        body.set_edgecolor("#444444")
+    if "cmedians" in parts:
+        parts["cmedians"].set_color("black")
+    # jittered points behind, so small groups are still readable
+    for i, v in enumerate(data):
+        jit = np.random.normal(0, 0.06, size=v.size)
+        ax.scatter(np.full(v.size, pos[i]) + jit, v, s=9, alpha=0.25,
+                   color=colors[i], edgecolors="none", zorder=2)
 
-    # Slim boxplot on top for quartiles/median.
-    bp = ax.boxplot(data, positions=positions, widths=0.18,
-                    patch_artist=True, showfliers=False, zorder=3)
-    for patch, c in zip(bp["boxes"], colors):
-        patch.set_facecolor(c)
-        patch.set_alpha(0.9)
-    for med in bp["medians"]:
-        med.set_color("black")
+    # The target cell's value, as a line across the plot plus a marker.
+    z_all = _robust_z(target_value, values[groups["All cells"]])
+    if np.isfinite(target_value):
+        ax.axhline(target_value, color="#C00000", linestyle="--", linewidth=1.6,
+                   zorder=4, label=f"cell {target_id} = {target_value:.3g}")
+        ax.scatter(pos, [target_value] * len(pos), marker="D", s=45,
+                   color="#C00000", zorder=5)
+        ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
-    # Target cell: red star on the dataset violin and on every group it belongs
-    # to (so you see it inside its own group AND vs the rest).
-    val = e["value"]
-    if np.isfinite(val):
-        ax.scatter([1], [val], marker="*", s=420, color="#D32F2F",
-                   edgecolors="black", linewidths=0.9, zorder=6)
-        for gi, gname in enumerate(labels[1:], start=2):
-            if e["groups"].get(gname, {}).get("in_group"):
-                ax.scatter([gi], [val], marker="*", s=420, color="#D32F2F",
-                           edgecolors="black", linewidths=0.9, zorder=6)
-
-    ax.set_xticks(positions)
-    ax.set_xticklabels(
-        [f"{_short_group_label(l)}\n(n={d.size})" for l, d in zip(labels, data)],
-        fontsize=10)
-    ax.tick_params(axis="x", labelrotation=0)
-    z = e["all"]["z"]
-    zt = "n/d" if not np.isfinite(z) else f"{z:.1f}σ"
-    flag = "   ⚠ OUTLIER" if e["all"]["is_outlier"] else ""
-    ax.set_title(f"{e['label']}  —  z={zt}{flag}", fontsize=14, fontweight="bold",
-                 color=("#D32F2F" if e["all"]["is_outlier"] else "#222222"),
-                 pad=12)
+    ax.set_xticks(pos)
+    ax.set_xticklabels([f"{n}\n(n={d.size})\n{z}"
+                        for n, d, z in zip(names, data, ztexts)], fontsize=8)
+    ax.set_ylabel(label)
+    flag = ""
+    if np.isfinite(z_all):
+        flag = "  —  OUTLIER" if abs(z_all) >= 3.0 else "  —  within range"
+    ztitle = "" if not np.isfinite(z_all) else f"  (robust Z vs all = {z_all:+.1f}{flag})"
+    ax.set_title(f"{label} — cell {target_id}{ztitle}", fontweight="bold")
     ax.grid(axis="y", alpha=0.3)
+    return fig
 
 
-def compare_cell_pages(summary, track_id, metrics=None, outlier_z=OUTLIER_Z,
-                       per_page=1, ncol=1):
-    """Build a LIST of figures (pages), each with up to ``per_page`` metrics.
+def compare_cell_pages(df, mask, target_id, pixel_size=1.0, frame_interval=1.0):
+    """Build one comparison figure per metric for ``target_id`` vs groups.
 
-    Default is ONE metric per page: a single large, legible plot you page
-    through with the navigable dialog (CompareCellDialog), so titles and X
-    labels never overlap. ``per_page``/``ncol`` can be raised to pack more
-    metrics per page if desired.
-    Returns (pages, comp) where pages is list[Figure] and comp is the data dict.
+    Returns a list of (page_title, Figure): each page is a single metric shown as
+    per-group violins (All / Mitotic / Non-mitotic / Control / Treated ...) with
+    the target cell drawn as a red line and its robust Z-score per group, so the
+    user can see, one characteristic at a time, whether the cell is an outlier.
     """
-    comp = compare_cell(summary, track_id, metrics=metrics, outlier_z=outlier_z)
-    if not comp["found"]:
-        fig, ax = plt.subplots(figsize=(7, 3))
-        ax.text(0.5, 0.5, f"Célula {track_id} não encontrada no resumo.",
-                ha="center", va="center")
-        ax.axis("off")
-        return [fig], comp
-
-    mets = list(comp["metrics"].keys())
-    if not mets:
-        fig, ax = plt.subplots(figsize=(7, 3))
-        ax.text(0.5, 0.5, "Nenhuma métrica numérica disponível para comparar.",
-                ha="center", va="center")
-        ax.axis("off")
-        return [fig], comp
-
-    groups = _grouping_sets(summary)
-    self_mask = (summary["track_id"].astype(int) == int(track_id)).to_numpy()
-
-    n_out = len(comp["outlier_metrics"])
-    head = (f"Célula {track_id} vs dataset e grupos  —  "
-            + (f"outlier em {n_out} métrica(s)" if n_out
-               else "dentro do normal em todas as métricas"))
-
-    per_page = max(1, int(per_page))
-    ncol = max(1, min(int(ncol), per_page))
-    chunks = [mets[i:i + per_page] for i in range(0, len(mets), per_page)]
+    summary = analysis.compute_track_summary(df, mask, pixel_size, frame_interval)
+    if summary is None or summary.empty:
+        raise ValueError("No per-track summary to compare against.")
+    ids = set(summary["track_id"].astype(int))
+    if int(target_id) not in ids:
+        raise ValueError(f"Cell {int(target_id)} is not in the dataset summary.")
+    trow = summary[summary["track_id"].astype(int) == int(target_id)].iloc[0]
+    groups = _compare_groups(summary, df)
 
     pages = []
-    for pi, chunk in enumerate(chunks):
-        nrow = int(np.ceil(len(chunk) / ncol))
-        if per_page == 1:
-            # One big plot per page: wide enough for ~8 group violins + labels.
-            figsize = (11.5, 6.4)
-        else:
-            figsize = (7.2 * ncol, 4.4 * nrow)
-        fig, axes = plt.subplots(nrow, ncol, figsize=figsize, squeeze=False)
-        axes = axes.ravel()
-        for ax in axes[len(chunk):]:
-            ax.axis("off")
-        for ax, m in zip(axes, chunk):
-            _draw_compare_axis(ax, summary, comp, m, track_id, groups, self_mask)
-        page_tag = (f"   (página {pi + 1}/{len(chunks)})" if len(chunks) > 1 else "")
-        fig.suptitle(head + page_tag, fontsize=13, fontweight="bold")
-        # Generous spacing so titles/X-labels never collide.
-        fig.tight_layout(rect=(0, 0, 1, 0.93), h_pad=3.0, w_pad=2.5)
-        pages.append(fig)
-    return pages, comp
+    for col, label in COMPARE_METRICS:
+        if col not in summary.columns:
+            continue
+        values = summary[col].to_numpy(dtype=float)
+        if not np.isfinite(values).any():
+            continue
+        tval = float(trow[col]) if np.isfinite(trow.get(col, np.nan)) else np.nan
+        pages.append((label, _compare_metric_figure(label, values, groups,
+                                                     tval, int(target_id))))
+    if not pages:
+        raise ValueError("No comparable metrics available.")
+    return pages
 
 
-def compare_cell_figure(summary, track_id, metrics=None, outlier_z=OUTLIER_Z):
-    """Backward-compatible single-figure entry point.
+# ---------------------------------------------------------------------------
+# Nuclear Morphometric Analysis (NMA): area vs NII, one point per (track, frame)
+# ---------------------------------------------------------------------------
+def nma_scatter(df, mask, pixel_size=1.0, treatment_config=None,
+                max_points=None):
+    """Area vs NII scatter, one point per (track, frame), after the NMA method.
 
-    Returns one figure containing ALL metrics (2-per-row, well spaced). Prefer
-    compare_cell_pages() + CompareCellDialog for the paginated, navigable view.
+    Reproduces the area-versus-Nuclear-Irregularity-Index plot: each cell
+    contributes one point per frame it is observed in, so a single nucleus
+    traces its size/shape over time. Points are coloured by the track's final
+    outcome. Returns the matplotlib Figure.
     """
-    pages, _ = compare_cell_pages(summary, track_id, metrics=metrics,
-                                  outlier_z=outlier_z,
-                                  per_page=max(1, _count_metrics(summary, metrics)),
-                                  ncol=2)
-    return pages[0]
+    nm = analysis.nuclear_morphometry(mask)
+    if nm is None or nm.empty:
+        raise ValueError("Nuclear morphometry (NII) needs a mask.")
+    nm = nm.dropna(subset=["nii", "area_px"])
+    if nm.empty:
+        raise ValueError("No nuclei with finite NII / area to plot.")
 
+    area = nm["area_px"].to_numpy(dtype=float)
+    if pixel_size != 1.0:
+        area = area * (pixel_size ** 2)
+    nii = nm["nii"].to_numpy(dtype=float)
+    tracks = nm["track_id"].to_numpy(dtype=int)
 
-def _count_metrics(summary, metrics):
-    if metrics:
-        return len(metrics)
-    if summary is None or summary.empty:
-        return 1
-    return max(1, sum(1 for m in COMPARE_METRICS
-                      if m in summary.columns
-                      and pd.api.types.is_numeric_dtype(summary[m])))
+    outcomes = _final_outcome_per_track(df)
+    colors = np.array([TRAJ_OUTCOME_COLORS.get(outcomes.get(int(t), "none"),
+                                               _TRAJ_DEFAULT_COLOR) for t in tracks])
+
+    if max_points and len(nii) > max_points:
+        idx = np.random.choice(len(nii), int(max_points), replace=False)
+        area, nii, colors = area[idx], nii[idx], colors[idx]
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+    ax.scatter(nii, area, c=colors, s=12, alpha=0.5, edgecolors="none")
+
+    from matplotlib.lines import Line2D
+    seen = set(outcomes.values())
+    handles = [Line2D([0], [0], marker="o", linestyle="", markersize=7,
+                      color=TRAJ_OUTCOME_COLORS[o], label=TRAJ_OUTCOME_LABELS[o])
+               for o in ("Mitosis", "Exit", "Death/Senescence", "Ambiguous")
+               if o in seen]
+    if handles:
+        ax.legend(handles=handles, title="Outcome", loc="upper right",
+                  fontsize=9, framealpha=0.9)
+
+    ax.set_xlabel(pretty("nii"))
+    ax.set_ylabel(f"Area ({'µm²' if pixel_size != 1.0 else 'px²'})")
+    ax.set_title("Nuclear Morphometry — Area vs NII (one point per cell-frame)",
+                 fontweight="bold")
+    ax.grid(alpha=0.3)
+    return fig
 
 
 # ---------------------------------------------------------------------------

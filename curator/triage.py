@@ -132,6 +132,7 @@ class TriageResult:
     population: dict = field(default_factory=dict)  # {dim: {center, scale, mean, n}}
     outliers: list = field(default_factory=list)    # far-from-population ids (info only)
     outlier_cutoff: float = 0.5
+    coverage: float = 0.0                           # annotation coverage in [0,1]
 
     def summary(self) -> str:
         n = len(self.scores)
@@ -139,7 +140,8 @@ class TriageResult:
             return "No cells to triage."
         base = (f"{n} cells: {len(self.review)} to review "
                 f"({100*len(self.review)/n:.0f}%), {len(self.accept)} accept "
-                f"({100*len(self.accept)/n:.0f}%) at cutoff {self.cutoff:.2f}.")
+                f"({100*len(self.accept)/n:.0f}%) at cutoff {self.cutoff:.2f} "
+                f"[annotation coverage {100*self.coverage:.0f}%].")
         if self.outliers:
             base += (f"  {len(self.outliers)} biological outlier(s) noted "
                      f"separately (not treated as errors).")
@@ -200,6 +202,29 @@ def _center_scale(values, center=DEVIATION_CENTER):
     if scale <= 1e-9:
         return None
     return {"center": c, "scale": scale, "mean": mean, "median": med, "n": int(v.size)}
+
+
+def annotation_coverage(df):
+    """Fraction of non-quarantined tracks that already have a final outcome.
+
+    Used to make the ``no_outcome`` penalty adaptive: at coverage ~0 (a fresh,
+    uncurated dataset) "no outcome" is non-discriminative and is down-weighted
+    toward zero; at coverage ~1 an uncurated straggler is notable and keeps the
+    full penalty. Returns a float in [0, 1].
+    """
+    if df is None or df.empty or COL_OUTCOME not in df.columns:
+        return 0.0
+    d = df.dropna(subset=[COL_TRACK]).copy()
+    if d.empty:
+        return 0.0
+    d[COL_TRACK] = d[COL_TRACK].astype(int)
+    d = d[(d[COL_TRACK] > 0) & (~d[COL_TRACK].map(is_quarantined_id))]
+    if d.empty:
+        return 0.0
+    finals = set(FINAL_OUTCOMES)
+    has_final = d.groupby(COL_TRACK)[COL_OUTCOME].agg(
+        lambda s: bool(set(s.astype(str)) & finals))
+    return float(has_final.mean()) if has_final.size else 0.0
 
 
 def population_stats(df, center=DEVIATION_CENTER):
@@ -320,6 +345,10 @@ def score_cells(df, thresholds, mask=None, weights=None, center=DEVIATION_CENTER
     d = df.dropna(subset=[COL_TRACK, COL_FRAME, COL_X, COL_Y]).copy()
     if d.empty:
         return []
+    # Coverage-adaptive no_outcome: on a mostly-uncurated dataset "has no outcome
+    # yet" is true of nearly everything and carries no information, so the penalty
+    # is scaled down toward zero; it returns to full as the dataset gets curated.
+    w["no_outcome"] = w["no_outcome"] * annotation_coverage(d)
     d[COL_TRACK] = d[COL_TRACK].astype(int)
     d = d[d[COL_TRACK] > 0]
     d = d.sort_values([COL_TRACK, COL_FRAME])
@@ -460,7 +489,8 @@ def triage_queue(df, thresholds, mask=None, cutoff=0.85, weights=None,
                 if c.deviation_score < outlier_cutoff and c.track_id not in review]
     return TriageResult(scores=scores, review=review, accept=accept,
                         cutoff=cutoff, population=pop,
-                        outliers=outliers, outlier_cutoff=outlier_cutoff)
+                        outliers=outliers, outlier_cutoff=outlier_cutoff,
+                        coverage=annotation_coverage(df))
 
 
 def validation_sample(accept_ids, n=50, seed=None):

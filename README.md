@@ -52,10 +52,15 @@ validate that accepted batch with a random sample and an empirical error rate.
   treated as errors; bulk-accept, and a random validation sample that yields an
   empirical error rate with a 95% confidence interval.
 - Assisted gap relinking with linear extrapolation.
+- Nuclear morphometry: per-frame Nuclear Irregularity Index (NII) and its
+  components (aspect, area/box, radius ratio, roundness) computed from the mask,
+  plottable and exported.
 - Statistics: lifetime, migration, motility, area, growth, outcomes, divisions,
   MSD, a temporal-gradient boxplot, per-cell trajectory plots and a custom plot.
 - Video export (single cell or full screen) and a per-track CSV summary.
-- Atomic, backed-up saving that never touches your original files.
+- Atomic, backed-up saving that never touches your original files, and writes
+  derived export tables on save (per-frame features, accumulated time-windows,
+  per-track summary, plus a validated-cells copy of each).
 
 ---
 
@@ -136,6 +141,9 @@ project/                       # run from here
     ├── validation.py          # validation-sample session and reliability plot
     ├── validation_dialog.py   # Qt window for sample validation
     ├── review.py              # persistence of reviewed lineages
+    ├── validated.py           # persistence of individually validated cells
+    ├── triage_review.py       # persistence of triage checkboxes
+    ├── exports.py             # derived export tables (features, windows, validated)
     ├── audit.py               # action audit log
     ├── stats.py               # statistics and all plots
     ├── tree_plot.py           # lineage tree plot
@@ -255,6 +263,15 @@ mother to a daughter flags the mother as Mitosis.
 orphan cells, ignored in diagnostics and dropped on save): 1,000,000–2,000,000. A
 transient offset is used only during re-sequencing and never reaches disk.
 
+**Nuclear morphometry (NII).** From the mask, the tool computes per cell and
+frame the Nuclear Irregularity Index after Filippi-Chiela et al. (2012):
+`NII = aspect − area/box + radius_ratio + roundness`, where aspect = major/minor
+axis, area/box = object area ÷ bounding-box area, radius_ratio = max÷min
+centroid-to-boundary radius, and roundness = perimeter² ÷ (4·π·area). A perfect
+disc sits near 2.2; irregular, elongated or multilobed nuclei score higher. The
+NII and its components are available as statistics (trajectory timeseries, custom
+plot via the per-track summary) and in the export tables.
+
 **Undo.** Every operation is undoable with **Ctrl+Z** or the Undo button; the
 history holds the last 10 actions. Operations that rewrite the whole movie
 snapshot the entire stack; the rest snapshot only the frames they touch.
@@ -266,6 +283,9 @@ snapshot the entire stack; the rest snapshot only the frames they touch.
 Most-used tools have single-key shortcuts so you can curate without leaving the
 canvas. They act on the current **[A]**/**[B]** selection and the current frame,
 exactly like the matching buttons (selection still comes from Shift/Ctrl+click).
+
+Each tool's button also shows its key in brackets (e.g. `Merge (...)  [g]`), so
+the shortcut is discoverable from the panel.
 
 The shortcuts are registered with `overwrite=True`, so they always fire even when
 napari binds the same key. The **manual-painting keys are deliberately left to
@@ -350,6 +370,15 @@ follows the rename. Use it when the tracker split one cell into two IDs.
 
 > Example: cell 8 becomes cell 19 mid-movie by mistake. [A]=8, [B]=19, Merge.
 
+> Dissolving a false mitosis: if [A] and [B] are in a mother–daughter
+> relationship (e.g. a "division" of cell 1 into 2 and 3 was really a
+> segmentation artefact and 1 and 2 were the same cell), merging them proves the
+> division never happened. The merge therefore **dissolves the whole division**:
+> every other daughter (here cell 3) is detached (`parent_id = -1`) and the
+> mother's Mitosis flag is cleared. Self-loops and divisions that an edit leaves
+> impossible (mother gone, daughter born at/before the mother) are repaired the
+> same way after every structural edit (merge, swap, relabel, exterminate).
+
 **Swap / cut (from here onward).** From the current frame on, swaps labels [A]↔[B]
 in every later frame. If [B] is empty, a new ID is reserved, turning the action
 into a cut ("from here on this is a new identity"). Outcomes and parent of the
@@ -383,7 +412,9 @@ match the track ID. Use it to clean up fragments after other operations.
 Keyboard shortcut: **X**.
 
 **Exterminate track [A] (whole movie).** Deletes [A] from every frame. Daughters
-that pointed at it lose their mother (`parent_id = -1`).
+that pointed at it lose their mother (`parent_id = -1`). The napari tracks layer is
+updated in place after every edit (including this one), so it no longer disappears
+from the layer list when a track is exterminated.
 
 **Rescue orphan masks (assign new ID).** Scans all frames for masks present in the
 image but absent from the table and creates a new row with a new ID for each one.
@@ -495,12 +526,21 @@ that is merely unusual is not evidence that it is wrong, so atypicality alone ne
 sends a cell to review. Cells far from the population are instead listed in a
 **Biological outliers** section of the dialog for inspection — this is where real
 rare phenotypes (a giant cell, an unusually long-lived one, a hyper-motile one)
-show up without being mislabelled as errors. You review the worst, **bulk-accept**
+show up without being mislabelled as errors. Each review row has a **checkbox**:
+tick it once you have triaged that cell. The ticks are **saved between sessions**
+(in `triage_review.json`, created on first use, so old curations get it from the
+first reopen) and the dialog shows a "triaged X / N" counter. You review the
+worst, **bulk-accept**
 the confident remainder (above the cutoff, default 0.85, non-destructive — it only
 logs that those cells left the queue), then **draw a validation sample** to validate
 that batch. The penalty weights, the cutoff and the deviation parameters are
 defaults at the top of `triage.py`; pass `blend_deviation=True` to `triage_queue`
-to fold deviation back into the score (the legacy combined behaviour).
+to fold deviation back into the score (the legacy combined behaviour). The
+"no outcome yet" penalty is **scaled by annotation coverage**: on a mostly
+uncurated dataset it is near zero (almost everything is uncurated, so it carries
+no information) and it grows back to full as you curate, so a lone uncurated
+straggler in a finished dataset becomes notable again. The dialog summary reports
+the current coverage.
 
 **Detect identity swaps (no jump).** Finds frame transitions where two nearby
 tracks most likely exchanged labels. A clean swap leaves no jump, no gap and
@@ -549,6 +589,28 @@ frame) and refuses to save if any exist, backs up the current files to
 contact and area against the final mask, and reloads from disk. It overwrites the
 CSV and mask inside the `_curated` working folder — never your originals.
 
+After saving, it also writes a set of **derived export tables** into an
+`exports/` subfolder (best-effort: a failure here never affects the saved CSV).
+For both the full dataset and the **validated subset**, it writes:
+
+- `<base>_validated_cells.csv` — the main table restricted to validated tracks.
+- `<base>_features.csv` (+ `_validated`) — one row per (track, frame) with
+  per-frame nuclear morphometry (area_px, perimeter, circularity, aspect,
+  area_box, radius_ratio, roundness, NII) and per-step migration (step
+  displacement, cumulative path, net-from-start, instantaneous speed).
+- `<base>_windows.csv` (+ `_validated`) — one row per (track, frame), with a
+  **sliding window of N frames centred on that frame** (**N set by "Window for
+  accumulated export", default 7**; clamped at track edges, so `n_frames` is
+  smaller near the ends), accumulating the variation over the window:
+  displacement, delta path, persistence, area_cv, area_slope, path, net,
+  speed_mean, and the per-window mean and delta of every feature (including NII).
+- `<base>_summary.csv` (+ `_validated`) — the per-track statistics summary.
+
+A cell is **validated** when its whole lineage was marked reviewed (all of the
+family's cells are then included) or when it was individually confirmed in a
+validation sample. This applies on the **next save** of any session, including
+curations already in progress.
+
 ---
 
 ## Statistics tools
@@ -563,6 +625,23 @@ The **Statistics** tab. All figures open in separate matplotlib windows.
   report time in minutes. Affects every temporal metric.
 - **Exclude border-touching points** — when on, removes rows where the cell
   touches the frame border (partial measurements) from every plot.
+- **Window for accumulated export (default 7)** — the window length (in frames)
+  used for the `<base>_windows.csv` accumulated table written on SAVE ALL.
+- **Plot NMA (Area vs NII, per cell-frame)** — a scatter of area (Y) against the
+  Nuclear Irregularity Index (X) with **one point per (track, frame)**, so each
+  nucleus contributes a point for every frame it lived; points are coloured by the
+  track's final outcome. This reproduces the area-versus-NII view of the NMA
+  method and is handy for spotting senescent (large, regular), apoptotic (small,
+  regular) and irregular (high-NII) populations.
+- **Compare cell [A] vs dataset (by group)** — opens a **paginated** window with
+  **one metric per page** (Previous/Next), so nothing is squished. Each page shows
+  the distribution of that metric as **violin/density plots** for several groups
+  (All cells, Mitotic, Non-mitotic, and Control/Treated/Washout when present),
+  with the cell in [A] drawn as a red line and its **robust Z-score per group**
+  under each violin. The page title flags the cell as an **OUTLIER** when its
+  robust Z against all cells is ≥ 3, so you can tell at a glance, characteristic
+  by characteristic, where the cell stands out. Covers migration, area and the
+  nuclear-morphometry metrics (including NII).
 
 ### Quick statistics
 
@@ -587,7 +666,8 @@ Each button works on the per-track summary (one row per cell), except where note
 - **Export per-track summary (CSV)** — one row per cell with every computed metric
   (lifetime, total distance, net displacement, speed, directionality, mean/max
   area, diffusion, persistence, turning angle, confinement, outcome, mitotic flag,
-  first/last frame). This is the file you take to external analysis.
+  first/last frame, plus mean nuclear morphometry: `mean_nii` and the mean of
+  each component). This is the file you take to external analysis.
 
 ### Temporal-gradient boxplot
 
@@ -609,16 +689,26 @@ Exit blue, Death red, Ambiguous orange), with the treatment window shaded. The
 type is set by **Plot type**:
 
 - **timeseries** — one quantity (`area_px`, a velocity column, `perimeter`,
-  `circularity`, ...) vs frame; `perimeter` and `circularity` are computed from the
-  mask on demand.
-- **cumulative** — running sum of the value (e.g. distance traveled); defaults to
-  euclidean displacement if no column is chosen.
+  `circularity`, the nuclear-morphometry columns `aspect`, `area_box`,
+  `radius_ratio`, `roundness`, `nii`, ...) vs frame; `perimeter`, `circularity`
+  and the morphometry/NII columns are computed from the mask on demand.
+- **cumulative** — running accumulation along each track of the chosen quantity:
+  with a quantity selected it shows the **cumulative change of that quantity**
+  (including `nii` and the other morphometry columns, computed from the mask on
+  demand); with no quantity it falls back to cumulative euclidean displacement
+  (the distance odometer). Earlier builds ignored the quantity here and always
+  drew the odometer — that is fixed.
 - **spider** — each cell's X/Y trajectory translated to start at the origin.
 - **window** — a centered rolling-window statistic.
 
 Auxiliary controls: window metric (`persistence`, `area_cv`, `area_slope`, `path`,
-`net`, `speed_mean`), window size (default 11), smoothing (timeseries only), max
-tracks (longest first, 0 = all), and label track IDs at line ends.
+`net`, `speed_mean`, and the NII-variation metrics `nii_mean`, `nii_cv`,
+`nii_slope` — the within-window mean, coefficient of variation and trend of the
+Nuclear Irregularity Index), window size (default 11), smoothing (timeseries
+only), max tracks (longest first, 0 = all), and label track IDs at line ends.
+All plot titles, axes and legends (including outcome names) are in English, and
+quantity titles are shown with friendly names (e.g. `nii` → "Nuclear Irregularity
+Index").
 
 ### Custom plot
 
@@ -645,6 +735,9 @@ Everything lives inside the `<experiment>_curated` working folder:
 | `backups/<timestamp>/` | Copy of the files before each save. |
 | `curation_audit.log.csv` | One row per action (timestamp, action, IDs, detail). |
 | `lineage_review.json` | Which lineages (by root) you marked reviewed. |
+| `cell_validation.json` | Which individual cells you confirmed in a validation sample. |
+| `triage_review.json` | Which triage-queue cells you ticked off as triaged. |
+| `exports/<base>_*.csv` | Derived tables written on SAVE ALL: `validated_cells`, `features`, `windows`, `summary`, each also as a `_validated` copy. |
 
 The saved CSV uses the internal schema (`track_id`, `frame`, `pos_x`, `pos_y`,
 `outcome`, `parent_id`, `continuous_label`, `treatment`, `at_border`, `area_px`)

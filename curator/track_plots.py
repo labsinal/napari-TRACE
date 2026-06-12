@@ -35,11 +35,11 @@ from .config import (
     TREAT_TREATED, TREAT_WASHOUT,
 )
 
-# Outcome -> line colour. Matches the green "Mitose" / blue "Fim" look of the
+# Outcome -> line colour. Green = Mitosis, blue = Exit, to match the rest of
 # reference figures, with distinct colours for the other final outcomes.
 OUTCOME_COLORS = {
-    OUTCOME_MITOSIS: "#55C57A",   # green  (Mitose)
-    OUTCOME_EXIT:    "#4C9BE8",   # blue   (Fim / saiu de campo)
+    OUTCOME_MITOSIS: "#55C57A",   # green  (Mitosis)
+    OUTCOME_EXIT:    "#4C9BE8",   # blue   (Exit / left the field)
     OUTCOME_DEATH:   "#C44E52",   # red
     OUTCOME_AMBIGUOUS: "#E0A030",  # amber  (Ambiguo / incerto)
     "none":          "#B0B0B0",   # grey   (uncurated)
@@ -92,9 +92,9 @@ def _shade_treatment(ax, treatment_config, max_frame):
 
 def _outcome_legend(ax):
     handles = [
-        Line2D([0], [0], color=OUTCOME_COLORS[OUTCOME_MITOSIS], lw=2, label="Mitose"),
-        Line2D([0], [0], color=OUTCOME_COLORS[OUTCOME_EXIT], lw=2, label="Fim"),
-        Line2D([0], [0], color=OUTCOME_COLORS[OUTCOME_DEATH], lw=2, label="Morte"),
+        Line2D([0], [0], color=OUTCOME_COLORS[OUTCOME_MITOSIS], lw=2, label="Mitosis"),
+        Line2D([0], [0], color=OUTCOME_COLORS[OUTCOME_EXIT], lw=2, label="Exit"),
+        Line2D([0], [0], color=OUTCOME_COLORS[OUTCOME_DEATH], lw=2, label="Death"),
         Line2D([0], [0], color=OUTCOME_COLORS[OUTCOME_AMBIGUOUS], lw=2, label="Ambiguo"),
     ]
     ax.legend(handles=handles, title="Identificacao", fontsize=8, loc="best")
@@ -179,9 +179,9 @@ def _directionality_series(g, pixel_size, frame_interval):
 
 
 DERIVED_SERIES = {
-    "speed":          ("Velocidade", _speed_series),
-    "cum_distance":   ("Distancia Acumulada", _cumdist_series),
-    "abs_displacement": ("Deslocamento Linear", _absdisp_series),
+    "speed":          ("Speed", _speed_series),
+    "cum_distance":   ("Cumulative Distance", _cumdist_series),
+    "abs_displacement": ("Linear Displacement", _absdisp_series),
     "directionality": ("Direcionalidade (0 a 1)", _directionality_series),
 }
 
@@ -250,7 +250,7 @@ def track_series(df, y, mask=None, pixel_size=1.0, frame_interval=1.0,
     if drew == 0:
         raise ValueError("No tracks long enough to plot (raise data or lower min_frames).")
 
-    ax.set_xlabel("Tempo Absoluto (Frame do Microscopio)")
+    ax.set_xlabel("Time (frame)")
     ax.set_ylabel(ylabel or (DERIVED_SERIES[y][0] if is_derived else y))
     ax.set_title(title or (DERIVED_SERIES[y][0] if is_derived else y),
                  fontweight="bold")
@@ -265,7 +265,7 @@ def track_series(df, y, mask=None, pixel_size=1.0, frame_interval=1.0,
 def spider_plot(df, pixel_size=1.0, min_frames=2, title="Spider Plot Global"):
     """Recentre every track to start at (0, 0) and overlay the trajectories.
 
-    Each line is coloured by final outcome (green = Mitose, blue = Fim, ...).
+    Each line is coloured by final outcome (green = Mitosis, blue = Exit, ...).
     Returns the matplotlib Figure.
     """
     valid = df.dropna(subset=[COL_TRACK, COL_FRAME, COL_X, COL_Y]).copy()
@@ -289,8 +289,8 @@ def spider_plot(df, pixel_size=1.0, min_frames=2, title="Spider Plot Global"):
         ax.annotate(str(int(tid)), (xs[-1], ys[-1]), fontsize=7,
                     color=color, fontweight="bold")
 
-    ax.set_xlabel("Deslocamento X")
-    ax.set_ylabel("Deslocamento Y")
+    ax.set_xlabel("X displacement")
+    ax.set_ylabel("Y displacement")
     ax.set_title(title, fontweight="bold")
     ax.set_aspect("equal", adjustable="datalim")
     _outcome_legend(ax)
@@ -338,12 +338,12 @@ def _win_slope(frames, xs, ys, vals, frame_interval):
 
 
 WINDOW_METRICS = {
-    "persistence":  ("Persistencia", "Persistencia Migratoria Local", _win_persistence, False),
-    "path":         ("Distancia Caminhada", "Esforco Motor na Janela", _win_path, False),
-    "net":          ("Deslocamento Reto", "Eficacia de Migracao na Janela", _win_net, False),
-    "mean_speed":   ("Velocidade Media", "Velocidade Media por Blocos", _win_mean_speed, False),
-    "area_cv":      ("Variacao (CV)", "Instabilidade do Envelope (CV)", _win_cv, True),
-    "slope":        ("Slope (Tendencia)", "Taxa de Expansao/Retracao (Slope)", _win_slope, True),
+    "persistence":  ("Persistence", "Local Migratory Persistence", _win_persistence, False),
+    "path":         ("Path Length", "Motor Effort in Window", _win_path, False),
+    "net":          ("Net Displacement", "Migration Efficacy in Window", _win_net, False),
+    "mean_speed":   ("Mean Speed", "Mean Speed per Window", _win_mean_speed, False),
+    "area_cv":      ("Area Variation (CV)", "Nuclear Envelope Instability (CV)", _win_cv, True),
+    "slope":        ("Area Slope (trend)", "Expansion / Retraction Rate (slope)", _win_slope, True),
 }
 
 

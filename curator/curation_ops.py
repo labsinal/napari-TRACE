@@ -122,6 +122,34 @@ def link_parent(state, mother, daughter, force=False):
     return OpResult(True, msg)
 
 
+def unlink_parent(state, child):
+    """Detach a cell from its mother (parent_id -> -1).
+
+    Used by the lineage editor's remove-daughter / detach actions. If the former
+    mother is left with no daughters, its auto Mitosis flag is cleared so the
+    lineage stays coherent.
+    """
+    if child == 0:
+        return OpResult(False, "Select a cell to detach.")
+    df = state.df
+    cur = df.loc[df[COL_TRACK] == int(child), COL_PARENT]
+    cur = cur[cur > 0]
+    if cur.empty:
+        return OpResult(False, f"Cell {int(child)} has no parent to remove.")
+    mother = int(cur.iloc[0])
+    state.save_state(frames=[], label="unlink lineage")
+    df.loc[df[COL_TRACK] == int(child), COL_PARENT] = -1
+    msg = f"Cell {int(child)} detached from mother {mother}."
+    remaining = lineage.classify_lineage(df).children_of.get(mother, [])
+    if not remaining:
+        sel = (df[COL_TRACK] == mother) & \
+              (df[COL_OUTCOME].astype(str) == OUTCOME_MITOSIS)
+        if sel.any():
+            df.loc[sel, COL_OUTCOME] = ""
+            msg += f" Mother {mother} has no other daughters; Mitosis flag cleared."
+    return OpResult(True, msg)
+
+
 # ---------------------------------------------------------------------------
 # Merge / swap / relabel / delete
 # ---------------------------------------------------------------------------
@@ -141,12 +169,119 @@ def _repoint_children(df, old_parent, new_parent):
     df.loc[sel, COL_PARENT] = int(new_parent)
 
 
+def _track_parent(df, t):
+    """Return the recorded parent_id of track ``t`` (>0) or -1 if none."""
+    p = df.loc[df[COL_TRACK] == int(t), COL_PARENT]
+    p = p[p > 0]
+    return int(p.iloc[0]) if not p.empty else -1
+
+
+def _dissolve_division(df, mother):
+    """Detach every daughter of ``mother`` and clear its Mitosis flag.
+
+    Used when an edit proves a recorded division was wrong (e.g. a mother merged
+    with one of its own daughters): the division no longer exists, so the other
+    daughters must lose their parent and the mother must lose the Mitosis flag.
+    Returns a short message describing what changed (or "").
+    """
+    m = int(mother)
+    daughters = sorted({int(t) for t in
+                        df.loc[df[COL_PARENT] == m, COL_TRACK].dropna().astype(int).unique()
+                        if int(t) != m})
+    parts = []
+    if daughters:
+        df.loc[df[COL_PARENT] == m, COL_PARENT] = -1
+        parts.append(f"daughters {daughters} detached")
+    sel = (df[COL_TRACK] == m) & (df[COL_OUTCOME].astype(str) == OUTCOME_MITOSIS)
+    if sel.any():
+        df.loc[sel, COL_OUTCOME] = ""
+        parts.append(f"Mitosis flag of {m} cleared")
+    return ("Division of " + str(m) + " dissolved (" + "; ".join(parts) + ").") \
+        if parts else ""
+
+
+def dissolve_invalid_divisions(df):
+    """Repair any division left topologically invalid by an edit (in place).
+
+    A recorded division (mother -> daughters) is dissolved when the mother no
+    longer exists, a cell is its own parent, or a daughter is born at/before the
+    mother. Dissolving detaches the daughters (parent_id -> -1) and clears the
+    mother's Mitosis flag, so a wrongly recorded mitosis disappears from the
+    genealogy after the cells are edited. Returns a short message (or "").
+    """
+    if df is None or df.empty or COL_PARENT not in df.columns:
+        return ""
+    notes = []
+    # Self-loops (a cell pointing at itself) -> detach.
+    self_loop = df[COL_TRACK].astype("Int64") == df[COL_PARENT].astype("Int64")
+    if self_loop.any():
+        df.loc[self_loop, COL_PARENT] = -1
+    tracks = set(df[COL_TRACK].dropna().astype(int).unique())
+    firsts = (df.dropna(subset=[COL_FRAME])
+              .groupby(df[COL_TRACK].astype(int))[COL_FRAME].min().to_dict())
+    groups = lineage.classify_lineage(df)
+    for mother, daughters in list(groups.children_of.items()):
+        m = int(mother)
+        invalid = m not in tracks
+        if not invalid:
+            mf = firsts.get(m)
+            for d in daughters:
+                d = int(d)
+                if d == m:
+                    invalid = True
+                    break
+                df_first = firsts.get(d)
+                if df_first is not None and mf is not None and df_first <= mf:
+                    invalid = True
+                    break
+        if invalid:
+            msg = _dissolve_division(df, m)
+            if msg:
+                notes.append(msg)
+    return " ".join(notes)
+
+
 def merge(state, a, b):
     if a == 0 or b == 0:
         return OpResult(False, "Select valid IDs.")
+    df = state.df
+    # A mother merged with one of its own daughters means the recorded division
+    # was a segmentation artefact: the two were the same cell. Detect it BEFORE
+    # the rename (afterwards the parent-child relationship is gone) so we can
+    # dissolve the division instead of carrying the (now impossible) lineage.
+    pa, pb = _track_parent(df, a), _track_parent(df, b)
+    mother_daughter = (pa == int(b)) or (pb == int(a))
+    grandparent = -1
+    div_daughters = []
+    if mother_daughter:
+        mother = a if pb == int(a) else b      # the one that was the parent
+        grandparent = _track_parent(df, mother)
+        # Daughters of the false division, captured BEFORE the rename (afterwards
+        # they still reference the old mother id). Exclude the cell merged away.
+        div_daughters = sorted({int(t) for t in
+                                df.loc[df[COL_PARENT] == int(mother), COL_TRACK]
+                                .dropna().astype(int).unique() if int(t) != int(a)})
+
     state.save_state(full=True, label="merge")          # touches all frames
     state.mask[state.mask == a] = b
-    df = state.df
+
+    if mother_daughter:
+        df.loc[df[COL_TRACK] == a, [COL_TRACK, COL_CLABEL]] = b
+        # Detach the surviving daughters and anything still pointing at the old
+        # mother id or at the merged-away cell, then give b the grandparent.
+        if div_daughters:
+            df.loc[df[COL_TRACK].astype(int).isin(div_daughters), COL_PARENT] = -1
+        df.loc[df[COL_PARENT].isin([int(mother), int(a)]), COL_PARENT] = -1
+        gp = int(grandparent) if int(grandparent) != int(b) else -1
+        df.loc[df[COL_TRACK] == b, COL_PARENT] = gp
+        sel = (df[COL_TRACK] == b) & (df[COL_OUTCOME].astype(str) == OUTCOME_MITOSIS)
+        if sel.any():
+            df.loc[sel, COL_OUTCOME] = ""
+        dissolve_invalid_divisions(df)
+        note = (f"division dissolved: daughters {div_daughters} detached, "
+                f"Mitosis cleared" if div_daughters else "division dissolved")
+        return OpResult(True, f"Track {a} merged into {b}. {note}.")
+
     mother_of_b = df.loc[df[COL_TRACK] == b, COL_PARENT].max()
     if pd.isna(mother_of_b):
         mother_of_b = -1
@@ -155,7 +290,9 @@ def merge(state, a, b):
     # Track a no longer exists; any daughters that pointed to a now point to b
     # (a was merged into b, so b inherits a's offspring).
     _repoint_children(df, a, b)
-    return OpResult(True, f"Track {a} merged into {b}.")
+    extra = dissolve_invalid_divisions(df)
+    msg = f"Track {a} merged into {b}."
+    return OpResult(True, (msg + " " + extra).strip() if extra else msg)
 
 
 def swap_future(state, a, b, frame):
@@ -193,7 +330,8 @@ def swap_future(state, a, b, frame):
     df.loc[mask_b, COL_OUTCOME] = ""
     df.loc[mask_a, [COL_TRACK, COL_CLABEL]] = b
     df.loc[mask_b, [COL_TRACK, COL_CLABEL]] = a
-    return OpResult(True, f"Future swap: {a} <-> {b}")
+    extra = dissolve_invalid_divisions(df)
+    return OpResult(True, (f"Future swap: {a} <-> {b}. " + extra).strip())
 
 
 def swap_local(state, a, b, frame):
@@ -215,7 +353,8 @@ def swap_local(state, a, b, frame):
     df.loc[idx_b, COL_OUTCOME] = ""
     df.loc[idx_a, [COL_TRACK, COL_CLABEL]] = b
     df.loc[idx_b, [COL_TRACK, COL_CLABEL]] = a
-    return OpResult(True, "Local swap done.")
+    extra = dissolve_invalid_divisions(df)
+    return OpResult(True, ("Local swap done. " + extra).strip())
 
 
 def relabel_new(state, a):
@@ -231,7 +370,8 @@ def relabel_new(state, a):
     # The whole track a was renamed to new_id; its daughters follow so the
     # lineage stays intact (they remain children of the same physical cell).
     _repoint_children(df, a, new_id)
-    return OpResult(True, f"New track created: {new_id}")
+    extra = dissolve_invalid_divisions(df)
+    return OpResult(True, (f"New track created: {new_id}. " + extra).strip())
 
 
 def delete_here(state, a, frame):
@@ -253,8 +393,9 @@ def delete_track(state, a):
     df = state.df
     df = df[df[COL_TRACK] != a]
     df.loc[df[COL_PARENT] == a, COL_PARENT] = -1
+    extra = dissolve_invalid_divisions(df)
     state.df = df
-    return OpResult(True, f"Track {a} exterminated from all frames.")
+    return OpResult(True, (f"Track {a} exterminated from all frames. " + extra).strip())
 
 
 # ---------------------------------------------------------------------------

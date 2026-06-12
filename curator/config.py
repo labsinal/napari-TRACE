@@ -5,10 +5,9 @@ ID ranges and curation thresholds.
 This module is intentionally free of any Qt / napari / pandas-heavy logic so it
 can be imported anywhere (including from test code) with no side effects.
 
-Addresses:
-  * Item 4  - single source of truth for every reserved ID range (namespacing).
-  * Item 10 - curation thresholds pulled out of the code; optionally derived
-              automatically from the dataset (see thresholds_from_dataset()).
+Provides a single source of truth for every reserved ID range (namespacing)
+and the curation thresholds, which can optionally be derived automatically
+from the dataset (see thresholds_from_dataset()).
 """
 
 from __future__ import annotations
@@ -161,7 +160,7 @@ SHORT_TAIL_LENGTH = 12
 
 
 # ---------------------------------------------------------------------------
-# Item 4: reserved ID ranges (namespacing)
+# Reserved ID ranges (namespacing)
 # ---------------------------------------------------------------------------
 # A single, coherent layout for the positive-integer ID space. Every operation
 # that mints special IDs and every filter that must ignore them refer to THESE
@@ -193,7 +192,7 @@ def is_quarantined_id(value: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Item 10: curation thresholds (no more magic numbers in the code)
+# Curation thresholds (no more magic numbers in the code)
 # ---------------------------------------------------------------------------
 @dataclass
 class Thresholds:
@@ -207,7 +206,7 @@ class Thresholds:
     min_valid_frames: int = 20          # tracks shorter than this are "short"
     max_jump_px: float = 40.0           # per-frame displacement above this is a "jump"
     gap_tolerance: int = 1              # frame gaps larger than this count as a gap
-    # Morphology (item 12), in robust-statistics (MAD) multiples:
+    # Morphology, in robust-statistics (MAD) multiples:
     area_mad_k: float = 3.5             # |area - median| > k*MAD  -> flagged
     min_solidity: float = 0.85          # solidity below this -> concave/leaky mask
     max_eccentricity: float = 0.98      # eccentricity above this -> sliver/artefact
@@ -215,7 +214,7 @@ class Thresholds:
     mitosis_life_lo: float = 0.5        # (legacy, unused) < median * lo
     mitosis_life_hi: float = 1.5        # (legacy, unused) > median * hi
     mitosis_life_mad_k: float = 4.0     # flag if |life-median| > k*MAD (robust)
-    # Assisted gap relinking (item 13):
+    # Assisted gap relinking:
     relink_search_radius_px: float = 60.0
     # Identity-swap detection: two co-existing tracks within this distance at a
     # frame whose next-frame assignment is cheaper when exchanged.

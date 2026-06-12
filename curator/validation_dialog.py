@@ -32,14 +32,6 @@ _COLS = ["Cell", "Frame", "Score", "Area", "Mobility", "Lifetime", "Outcome",
          "Why", "OK"]
 _C_CELL, _C_FRAME, _C_SCORE, _C_AREA, _C_MOB, _C_LIFE, _C_OUT, _C_WHY, _C_OK = range(9)
 
-# Columns that reveal the automatic's confidence. During a BLIND validation pass
-# these stay hidden so the reviewer judges each cell on its own merits and can't
-# be biased by the score it was given. They are revealed only once every sampled
-# cell has been reviewed -- at which point the score/error relationship is shown
-# honestly in the reliability plot. See the "Why" column too: its per-cell
-# reasons are also score-derived, so it is masked during the blind pass.
-_SCORE_COLS = (_C_SCORE, _C_AREA, _C_MOB, _C_LIFE, _C_OUT)
-
 # Row background by status.
 _STATUS_BG = {
     "pending":  None,
@@ -51,12 +43,13 @@ _STATUS_BG = {
 
 class ValidationDialog(QDialog):
 
-    def __init__(self, parent, state, session, jump_cb, plot_cb):
+    def __init__(self, parent, state, session, jump_cb, plot_cb, validate_cb=None):
         super().__init__(parent)
         self.state = state
         self.session = session
         self.jump_cb = jump_cb            # jump_cb(frame, track_id)
         self.plot_cb = plot_cb            # plot_cb(session) -> shows the figure
+        self.validate_cb = validate_cb    # validate_cb(track_id, bool) -> persist
         self._updating = False            # guards programmatic checkbox changes
         self._row_of = {}                 # track_id -> table row
 
@@ -65,12 +58,10 @@ class ValidationDialog(QDialog):
         v = QVBoxLayout(self)
 
         intro = QLabel(
-            "Blind validation: the automatic score is HIDDEN while you review so "
-            "your judgement isn't biased by it. Step through each sampled cell "
-            "(double-click a row to jump to it). Edit any cell that is wrong — "
-            "every edit is logged below — then tick OK. Tick OK directly if the "
-            "cell was already correct. When all cells are reviewed, the scores "
-            "are revealed and you can plot the score-vs-error reliability.")
+            "Step through each sampled cell (double-click a row to jump to it). "
+            "Edit any cell that is wrong — every edit is logged below — then tick "
+            "OK. Tick OK directly if the automatic call was already correct. When "
+            "all cells are reviewed, plot the score-vs-error reliability.")
         intro.setWordWrap(True)
         v.addWidget(intro)
 
@@ -85,7 +76,6 @@ class ValidationDialog(QDialog):
         for c in (_C_CELL, _C_FRAME, _C_SCORE, _C_AREA, _C_MOB, _C_LIFE, _C_OUT, _C_OK):
             hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self._build_rows()
-        self._set_score_columns_hidden(True)   # blind during the pass
         self.table.cellDoubleClicked.connect(self._on_double_click)
         self.table.itemChanged.connect(self._on_item_changed)
         v.addWidget(self.table, stretch=3)
@@ -148,7 +138,6 @@ class ValidationDialog(QDialog):
 
     def refresh(self):
         """Re-sync table colors, the 'Why' column, the log and the footer."""
-        done = self.session.complete
         self._updating = True
         for tid, row in self._row_of.items():
             r = self.session.reviews[tid]
@@ -160,13 +149,7 @@ class ValidationDialog(QDialog):
                     it.setBackground(brush)
             why = self.table.item(row, _C_WHY)
             if why is not None:
-                # During the blind pass, do NOT reveal the score-derived reasons
-                # (they would betray why the automatic was unsure). Only show the
-                # neutral edit status. Once complete, reveal the full reasoning.
-                if done:
-                    tag = "; ".join(r.reasons) if r.reasons else (r.outcome or "—")
-                else:
-                    tag = "—"
+                tag = "; ".join(r.reasons) if r.reasons else (r.outcome or "—")
                 if r.modified:
                     tag = f"[EDITED {len(r.edits)}x] " + tag
                 why.setText(tag)
@@ -175,9 +158,6 @@ class ValidationDialog(QDialog):
                 ok.setCheckState(Qt.Checked if r.checked else Qt.Unchecked)
         self._updating = False
 
-        # Reveal the hidden score columns only once the blind pass is complete.
-        self._set_score_columns_hidden(not done)
-
         # transient log (newest first)
         self.log.clear()
         for ts, tid, action, detail in self.session.edit_log_lines():
@@ -185,16 +165,12 @@ class ValidationDialog(QDialog):
                 f"{ts.split('T')[-1]}  ·  cell {tid}  ·  {action}  ·  {detail}"))
 
         self.status.setText(self.session.summary_text())
+        done = self.session.complete
         self.btn_plot.setEnabled(True)
         self.btn_plot.setText(
             "Show reliability plot" if done
             else f"Show reliability plot (partial {self.session.n_checked}/{self.session.n})")
         self.btn_next.setEnabled(not done)
-
-    def _set_score_columns_hidden(self, hidden: bool):
-        """Hide/show the score-revealing columns (the blind-test guard)."""
-        for c in _SCORE_COLS:
-            self.table.setColumnHidden(c, bool(hidden))
 
     # ------------------------------------------------------------------
     # Interaction
@@ -216,7 +192,13 @@ class ValidationDialog(QDialog):
         tid = item.data(Qt.UserRole)
         if tid is None:
             return
-        self.session.set_checked(int(tid), item.checkState() == Qt.Checked)
+        checked = item.checkState() == Qt.Checked
+        self.session.set_checked(int(tid), checked)
+        if self.validate_cb is not None:
+            try:
+                self.validate_cb(int(tid), checked)
+            except Exception:
+                pass
         self.refresh()
 
     def _jump_next_unchecked(self):

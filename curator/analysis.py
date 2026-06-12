@@ -2,11 +2,10 @@
 Analysis primitives: centroids, anomaly detection, morphology and per-track
 summaries.
 
-Addresses:
-  * Item 5  - single anomaly detector shared by diagnostics and save.
-  * Item 7  - one vectorized centroid helper replacing five hand-rolled loops.
-  * Item 12 - morphology-based segmentation error detection (area/solidity/
-              eccentricity) using outlier-robust statistics (median + MAD).
+Provides a single anomaly detector shared by the diagnostics panel and the
+pre-save filter, a vectorized centroid helper, and morphology-based
+segmentation error detection (area/solidity/eccentricity) using
+outlier-robust statistics (median + MAD).
 """
 
 from __future__ import annotations
@@ -22,12 +21,12 @@ from .config import (
     OUTCOME_MITOSIS, OUTCOME_EXIT, OUTCOME_DEATH, TREAT_CONTROL, Thresholds,
 )
 
-# skimage is a hard dependency of the curator; import at top (item 9).
+# skimage is a hard dependency of the curator; import at top.
 from skimage.measure import label as cc_label, regionprops_table
 
 
 # ---------------------------------------------------------------------------
-# Item 7: vectorized centroids
+# Vectorized centroids
 # ---------------------------------------------------------------------------
 def centroids_for_frame(mask_plane: np.ndarray) -> dict[int, tuple[float, float]]:
     """Return {label_id: (x, y)} centroids for every nonzero label in a plane.
@@ -69,7 +68,7 @@ def areas_for_frame(mask_plane: np.ndarray, pixel_area: float = 1.0) -> dict[int
 
 
 # ---------------------------------------------------------------------------
-# Item 5: unified anomaly detection
+# Unified anomaly detection
 # ---------------------------------------------------------------------------
 @dataclass
 class AnomalyReport:
@@ -93,7 +92,7 @@ def detect_anomalies(df: pd.DataFrame, thresholds: Thresholds,
                      include_outcome_checks: bool = True) -> AnomalyReport:
     """Single source of truth for short tracks, gaps, jumps and outcome issues.
 
-    Used by both the diagnostic panel (item 14) and the pre-save filter, so the
+    Used by both the diagnostic panel and the pre-save filter, so the
     two can never drift apart again. Quarantined IDs are skipped.
     """
     rep = AnomalyReport()
@@ -161,7 +160,7 @@ def detect_anomalies(df: pd.DataFrame, thresholds: Thresholds,
 
 
 # ---------------------------------------------------------------------------
-# Item 12: morphology-based segmentation errors (median + MAD)
+# Morphology-based segmentation errors (median + MAD)
 # ---------------------------------------------------------------------------
 def _robust_outliers(values: np.ndarray, k: float):
     """Return a boolean 'too large' mask using median + MAD (robust to outliers)."""
@@ -425,7 +424,16 @@ def compute_track_summary(df, mask, pixel_size=1.0, frame_interval=1.0):
         }
         rec.update(motil)
         records.append(rec)
-    return pd.DataFrame(records)
+    summary = pd.DataFrame(records)
+
+    # Mean nuclear morphometry (NII and its components) per track, from the mask.
+    if mask is not None and not summary.empty:
+        nm = nuclear_morphometry(mask)
+        if not nm.empty:
+            means = (nm.groupby("track_id")[MORPHOMETRY_COLS].mean()
+                     .rename(columns={c: f"mean_{c}" for c in MORPHOMETRY_COLS}))
+            summary = summary.merge(means, on="track_id", how="left")
+    return summary
 
 
 def motility_metrics(frames, xs, ys, frame_interval=1.0):
@@ -683,6 +691,92 @@ def auto_flag_border_exits(df, mask=None, tail=5, min_tail=3,
         empty = out[COL_OUTCOME].astype(str).isin(["", "nan", "None"])
         out.loc[sel & empty, COL_OUTCOME] = OUTCOME_EXIT
     return out
+
+
+# Nuclear morphometry (NII and its components, after Filippi-Chiela et al. 2012)
+# ---------------------------------------------------------------------------
+NMA_COLS = ["aspect", "area_box", "radius_ratio", "roundness", "nii"]
+MORPHOMETRY_COLS = ["area_px", "perimeter", "circularity"] + NMA_COLS
+
+
+def _radius_ratio(region):
+    """Max/min distance from the region centroid to its boundary pixels.
+
+    1.0 for a perfect disc, growing as the outline departs from a circle. Uses
+    the local crop so it is independent of absolute position.
+    """
+    from scipy import ndimage as ndi
+    img = region.image
+    if img.sum() < 4:
+        return np.nan
+    boundary = img & ~ndi.binary_erosion(img)
+    ys, xs = np.nonzero(boundary)
+    if ys.size < 2:
+        return np.nan
+    try:
+        cy, cx = region.centroid_local
+    except AttributeError:
+        cy, cx = region.local_centroid
+    d = np.sqrt((ys - cy) ** 2 + (xs - cx) ** 2)
+    d = d[d > 0]
+    if d.size < 2:
+        return np.nan
+    rmin = float(d.min())
+    return float(d.max() / rmin) if rmin > 0 else np.nan
+
+
+def nuclear_morphometry(mask):
+    """Per (frame, track_id) nuclear morphometry including the NII.
+
+    Computes, from the segmentation mask, the four shape descriptors the NMA
+    method combines (Image-Pro Plus conventions):
+
+      aspect       = major axis / minor axis            (>= 1, 1 = circle)
+      area_box     = object area / bounding-box area     (<= 1)
+      radius_ratio = max/min centroid-to-boundary radius (>= 1, 1 = circle)
+      roundness    = perimeter^2 / (4*pi*area)           (>= 1, 1 = circle)
+
+    and the Nuclear Irregularity Index
+
+      NII = aspect - area_box + radius_ratio + roundness
+
+    Also returns area_px, perimeter and circularity (= 1/roundness) so the table
+    is a superset of morphology_timeseries(). Returns columns:
+    frame, track_id, area_px, perimeter, circularity, aspect, area_box,
+    radius_ratio, roundness, nii.
+    """
+    from skimage.measure import regionprops
+    cols = ["frame", "track_id"] + MORPHOMETRY_COLS
+    if mask is None:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for f in range(mask.shape[0]):
+        plane = mask[f]
+        if not plane.any():
+            continue
+        for r in regionprops(plane):
+            area = float(r.area)
+            perim = float(r.perimeter)
+            minr, minc, maxr, maxc = r.bbox
+            box = float((maxr - minr) * (maxc - minc))
+            major = float(r.axis_major_length)
+            minor = float(r.axis_minor_length)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                circ = (4.0 * np.pi * area / perim ** 2) if perim > 0 else np.nan
+                aspect = (major / minor) if minor > 0 else np.nan
+                area_box = (area / box) if box > 0 else np.nan
+                roundness = (perim ** 2 / (4.0 * np.pi * area)) if area > 0 else np.nan
+            rr = _radius_ratio(r)
+            nii = (aspect - area_box + rr + roundness
+                   if np.all(np.isfinite([aspect, area_box, rr, roundness]))
+                   else np.nan)
+            rows.append({
+                "frame": int(f), "track_id": int(r.label),
+                "area_px": area, "perimeter": perim, "circularity": float(circ),
+                "aspect": float(aspect), "area_box": float(area_box),
+                "radius_ratio": float(rr), "roundness": float(roundness),
+                "nii": float(nii)})
+    return pd.DataFrame(rows, columns=cols)
 
 
 def morphology_timeseries(mask):
