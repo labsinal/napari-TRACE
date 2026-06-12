@@ -4,6 +4,7 @@ qtpy
 numpy
 pandas
 scikit-image
+scipy
 tifffile
 matplotlib
 imageio[ffmpeg]

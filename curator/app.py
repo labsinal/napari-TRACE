@@ -57,6 +57,11 @@ def main():
     parser.add_argument("--csv", default=None, help="Explicit CSV/TXT path")
     parser.add_argument("--mask", default=None, help="Explicit mask .tif path")
     parser.add_argument("--image", default=None, help="Explicit image .tif path")
+    parser.add_argument("--channel", action="append", default=None,
+                        metavar="PATH",
+                        help="Extra fluorescence channel (TIF stack, frame "
+                             "folder, or multi-channel TIF). Repeatable; "
+                             "display-only, never modified or saved.")
     parser.add_argument("--auto-thresholds", action="store_true",
                         help="(default on) Derive jump/length thresholds from the dataset")
     parser.add_argument("--no-auto-thresholds", action="store_true",
@@ -171,10 +176,25 @@ def main():
     # -- build state and launch UI --
     state = CuratorState(df, masks)
 
+    # -- extra fluorescence channels (display-only) --
+    from . import channels as channels_mod
+    n_frames = images.shape[0] if getattr(images, "ndim", 0) >= 3 else 1
+    channel_paths = list(args.channel or [])
+    if not channel_paths:
+        channel_paths = channels_mod.discover_channel_sources(
+            work_dir, used_paths=(csv_path, mask_path, image_path))
+        if channel_paths:
+            print(f"Auto-discovered {len(channel_paths)} extra channel(s): "
+                  + ", ".join(os.path.basename(p) for p in channel_paths))
+    channel_layers = channels_mod.load_channel_sources(channel_paths, n_frames)
+    if channel_layers:
+        print(f"Loaded {len(channel_layers)} fluorescence channel layer(s).")
+
     # Import the UI only now (after Qt + data are ready).
     from .ui import build_viewer
     build_viewer(state, images, csv_path, mask_path, work_dir,
-                 treatment_config, thresholds, column_map)
+                 treatment_config, thresholds, column_map,
+                 channel_layers=channel_layers)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,10 @@ validate that accepted batch with a random sample and an empirical error rate.
 ## Features
 
 - Overlay of raw video, segmentation mask, trajectories and ID labels in napari.
+- Optional extra **fluorescence channels** (apoptosis reporters such as cleaved
+  Caspase-3, cell-cycle indicators such as FUCCI, viability dyes) loaded as
+  display-only image layers you can flash on at the frame an anomaly is flagged,
+  to turn an "Ambiguous"/"Death" call into a biological one.
 - Identity fixes: merge, swap, cut, relabel, delete (single frame or whole track).
 - Mask reconciliation: sync the table to the mask, rescue orphan masks, split
   disconnected blobs, auto-track a single cell across the movie.
@@ -52,7 +56,11 @@ validate that accepted batch with a random sample and an empirical error rate.
   outliers (cells far from the population) surfaced separately instead of being
   treated as errors; bulk-accept, and a random validation sample that yields an
   empirical error rate with a 95% confidence interval.
-- Assisted gap relinking with linear extrapolation.
+- Assisted gap relinking with a choice of predictor: linear extrapolation, or a
+  clamped cubic **smoothing spline** fitted on the frames flanking the gap (for
+  curved trajectories). A separate **gap-fill** tool synthesizes interpolated
+  centroid rows in the missing frames (marked `interpolated`) so motility/MSD see
+  a continuous path.
 - Nuclear morphometry: per-frame Nuclear Irregularity Index (NII) and its
   components (aspect, area/box, radius ratio, roundness) computed from the mask,
   plottable and exported.
@@ -73,6 +81,8 @@ Python dependencies (see [`requirements.txt`](requirements.txt)):
 - `magicgui`, `qtpy`
 - `numpy`, `pandas`
 - `scikit-image`, `tifffile`
+- `scipy` — used for the smoothing-spline gap predictor; if absent, the spline
+  option falls back to linear automatically
 - `matplotlib`
 - `imageio[ffmpeg]` — optional, only for the video-export buttons
 
@@ -133,6 +143,7 @@ project/                       # run from here
     ├── state.py               # session state, undo history, ID pool
     ├── data_io.py             # load/save (backup + atomic write)
     ├── io_adapters.py         # format adapters (TrackMate, CTC) and file discovery
+    ├── channels.py            # extra fluorescence channels (display-only loading)
     ├── dialogs.py             # startup dialogs (column mapping, treatment)
     ├── treatment.py           # treatment-phase logic (control/treated/washout)
     ├── curation_ops.py        # curation operations (merge, swap, flags, lineage)
@@ -179,6 +190,7 @@ python run_curator.py
 | `--csv PATH` | Point at the CSV/TXT explicitly (skips auto-discovery). |
 | `--mask PATH` | Point at the mask `.tif` explicitly. |
 | `--image PATH` | Point at the image `.tif` explicitly. |
+| `--channel PATH` | Add an extra fluorescence channel (TIF stack, frame folder, or multi-channel TIF). Repeatable; display-only, never modified or saved. |
 | `--auto-thresholds` | Default. Derive jump/length thresholds from the dataset. |
 | `--no-auto-thresholds` | Use fixed thresholds (40 px jump, 20-frame minimum). |
 
@@ -202,6 +214,24 @@ Three inputs from the same experiment (same frame count, same image size):
 2. **Segmentation mask** — a `.tif` stack (T×H×W, one integer label per cell) or
    a folder with one `.tif` per frame.
 3. **Raw image** — the microscopy movie, also a `.tif` stack or a folder of frames.
+
+**Optional — extra fluorescence channels.** Any number of additional channels
+(e.g. a cleaved-Caspase-3 apoptosis reporter, a FUCCI cell-cycle indicator, a
+viability dye) can be overlaid as display-only layers. Two storage conventions
+are accepted, and the tool handles either:
+
+- **Separate files / folders, one per channel** — each its own TIF stack
+  (T×H×W) or its own folder of per-frame TIFs. Auto-discovered inside the
+  experiment folder when the file/folder name contains a channel token
+  (`caspase`, `fucci`, `gfp`, `mcherry`, `dapi`, `_ch1`, …), or passed
+  explicitly with `--channel`.
+- **A single multi-channel TIF** — one stack carrying a channel axis (T×C×H×W
+  or T×H×W×C); the channel axis is detected and split into one layer each.
+
+These channels are **never** treated as segmentation: they stay out of the
+mask, the ID pool, the tracking table and every save/export path. They are
+read-only context. They load hidden so they don't obscure the curation view;
+toggle them with `v` (see shortcuts).
 
 If your CSV already has an outcome column (`outcome`, `fate`, ...) or a parent
 column (`parent_id`, `mother_id`, ...), it is detected and preserved.
@@ -242,8 +272,18 @@ column (`parent_id`, `mother_id`, ...), it is detected and preserved.
 ## Core concepts
 
 **Layers.** `raw_video` (grayscale image), `cell_mask` (colored labels),
-`tracks` (trajectories), `ids` (numeric labels). Two side tabs: **Curation
-tools** and **Statistics**.
+`tracks` (trajectories), `ids` (numeric labels), plus one display-only image
+layer per extra fluorescence channel when supplied (hidden by default, toggled
+with `v`). Two side tabs: **Curation tools** and **Statistics**.
+
+Within each tab the tools are grouped into **titled, collapsible sections**
+(SETUP, NAVIGATION & VIEW, BASIC CURATION, OUTCOME FLAGS, LINEAGE, DIAGNOSTICS &
+EXPORT on the curation tab; QUICK STATISTICS, TEMPORAL GRADIENT, TRAJECTORY
+PLOTS, CUSTOM PLOT on the statistics tab). Click a section title to fold or
+unfold it, so the groups you are not using stay out of the way. The selection
+inputs ([A]/[B], progress) and the statistics calibration/filters sit in a fixed
+header above the sections and are always visible. The rarely-used groups (SETUP,
+DIAGNOSTICS & EXPORT, and the advanced plot builders) start collapsed.
 
 **The two working IDs, [A] and [B].** Most operations act on one or two IDs in
 the input boxes. [A] is the primary target / mother; [B] is the destination /
@@ -311,6 +351,8 @@ keep their napari meaning, so painting masks by hand is unaffected.
 | `l` | Link mother **[A]** → daughter **[B]** |
 | `f` | Toggle Focus mode |
 | `Shift` + `f` | Toggle Lineage focus |
+| `v` | Toggle extra fluorescence channels on/off (group) |
+| `Shift` + `v` | Cycle which single channel is shown solo |
 | `.` | Jump to next unreviewed lineage |
 | `,` | Jump to next cell without lineage |
 | `Ctrl` + `Z` | Undo |
@@ -566,10 +608,32 @@ interval — the defensible "we validated the auto-accepted set by random sampli
 argument for a paper.
 
 **Assisted gap relinking.** For each track with a temporal gap, the tool
-extrapolates where the cell should be in the missing frame (from the last two known
-points) and proposes the nearest candidate within the search radius (60 px by
-default). Double-click previews; Approve merges the candidate into the track across
-the gap.
+predicts where the cell should be in the missing frame and proposes the nearest
+candidate within the search radius (60 px by default). Double-click previews;
+Approve merges the candidate into the track across the gap. The **Gap predictor**
+dropdown selects how the position is predicted:
+
+- **linear** — extrapolation from the last two known points (the original
+  behaviour).
+- **spline** — a cubic **smoothing** spline fitted on up to five frames on each
+  side of the gap. Because an unconstrained interpolating cubic overshoots on
+  sparse, noisy points (it can fling the predicted centroid off-screen), this
+  path is deliberately conservative: it smooths rather than interpolates, uses
+  points on both sides of the gap, clamps every prediction to the flanking
+  bounding box, and **falls back to linear** for long gaps (> 12 frames), when
+  fewer than four flanking points exist, or when `scipy` is unavailable.
+
+**Fill gaps (interpolate trajectory).** A separate tool that, instead of
+reconnecting an existing track, **synthesizes new centroid rows** for the same
+track in the frames it was missing, using the same predictor (spline by
+default). The synthesized rows carry a position but no mask and are marked with
+an `interpolated` column, so area/morphometry stay blank for them and any
+statistic that needs a real segmentation can exclude them; migration, MSD and
+directionality, which only need centroids, become continuous across the gap.
+Review per track (double-click to preview the first filled frame) and Approve
+one, or Approve ALL. Gaps longer than the limit are skipped, on the assumption
+that a long disappearance is more likely a genuine exit/re-entry than a dropout
+worth inventing positions for.
 
 **Detect segmentation errors (morphology).** Flags cells with anomalous shape:
 area far above the frame median (robust median + MAD test, factor 3.5) suggesting a
@@ -626,6 +690,13 @@ The **Statistics** tab. All figures open in separate matplotlib windows.
   report time in minutes. Affects every temporal metric.
 - **Exclude border-touching points** — when on, removes rows where the cell
   touches the frame border (partial measurements) from every plot.
+- **Exclude interpolated (gap-filled) frames** — when on, removes the
+  synthesized centroid rows created by the gap-fill tool from every plot and from
+  the per-track summary. Off by default (including them is the point of filling a
+  gap). Toggle it to generate the same centroid-based figure — migration, MSD,
+  directionality — with and without the imputed frames, e.g. to show that a fill
+  did not distort a reported number, without leaving the tool. The two exclude
+  boxes are independent and compose.
 - **Window for accumulated export (default 7)** — the window length (in frames)
   used for the `<base>_windows.csv` accumulated table written on SAVE ALL.
 - **Plot NMA (Area vs NII, per cell-frame)** — a scatter of area (Y) against the
@@ -742,7 +813,9 @@ Everything lives inside the `<experiment>_curated` working folder:
 
 The saved CSV uses the internal schema (`track_id`, `frame`, `pos_x`, `pos_y`,
 `outcome`, `parent_id`, `continuous_label`, `treatment`, `at_border`, `area_px`)
-and is read back as such when you reopen the `_curated` folder.
+and is read back as such when you reopen the `_curated` folder. If you used the
+gap-fill tool, an extra `interpolated` boolean column marks the synthesized rows
+and round-trips with the file.
 
 ---
 
@@ -791,3 +864,25 @@ and is read back as such when you reopen the `_curated` folder.
   repoint the daughters.
 - **The mismatch warning does not block.** If you proceed with image and mask of
   different sizes, area and centroid measurements will be wrong.
+- **Extra channels are not checked for alignment.** A fluorescence channel whose
+  frame count or size differs from the movie is still loaded (with a printed
+  warning), so a mismatched channel will overlay misaligned. They are display
+  only and never enter any measurement, so they cannot corrupt the data — but
+  trust the overlay only when the channel matches the movie.
+- **Channel-axis detection is heuristic.** For a single multi-channel TIF the
+  channel axis is inferred (the small non-time, non-spatial axis). An unusual
+  layout — e.g. a genuine channel count above 8, or a movie with very few frames
+  — can be guessed wrong; in that case split the channels into separate files and
+  pass them with `--channel`.
+- **Interpolated rows are positions without masks.** The gap-fill tool
+  synthesizes centroids, not segmentation: those rows have `area_px`/morphometry
+  blank (NaN) and are marked `interpolated`. They make centroid-only statistics
+  (migration, MSD, directionality) continuous across a gap, but a spline fill is
+  still a model of where the cell *probably* was, not a measurement — treat long
+  fills with the same caution as any imputation. Gaps beyond the length limit are
+  left unfilled on purpose.
+- **The spline predictor degrades to linear silently.** On long gaps, sparse
+  flanking data, or a missing `scipy`, the "spline" option returns the linear
+  prediction. This is intended (it prevents overshoot), but it means choosing
+  "spline" does not guarantee a curved fill — the status message names the method
+  actually used per fill.

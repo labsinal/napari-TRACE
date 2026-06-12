@@ -256,6 +256,74 @@ class RelinkDialog(QDialog):
             self.lst.takeItem(self.lst.row(item))
 
 
+class GapFillDialog(QDialog):
+    """Review and approve synthesized gap fills (interpolated centroid rows).
+
+    Distinct from RelinkDialog: a relink reconnects an existing candidate track
+    across a gap, whereas a fill invents new per-frame rows for the SAME track in
+    the frames it was missing, so motility/MSD see a continuous path.
+    """
+
+    def __init__(self, viewer, state, fills, jump_cb, approve_cb, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Fill gaps (interpolate trajectory)")
+        self.resize(600, 440)
+        self.jump_cb = jump_cb
+        self.approve_cb = approve_cb
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Synthesized centroid rows for frames each track was missing "
+            "(double-click to preview the first filled frame). These rows carry "
+            "a position but no mask and are marked 'interpolated'."))
+        self.lst = QListWidget()
+        for fl in fills:
+            n = len(fl.frames)
+            span = f"{fl.frames[0]}..{fl.frames[-1]}" if n else "-"
+            it = QListWidgetItem(
+                f"track {fl.track_id}: fill {n} frame(s) [{span}] "
+                f"between {fl.gap_start} and {fl.gap_end}  ({fl.method})")
+            it.setData(Qt.UserRole, fl)
+            self.lst.addItem(it)
+        self.lst.itemDoubleClicked.connect(self._preview)
+        layout.addWidget(self.lst)
+
+        row = QHBoxLayout()
+        btn_approve = QPushButton("Approve selected")
+        btn_approve_all = QPushButton("Approve ALL")
+        btn_close = QPushButton("Close")
+        btn_approve.clicked.connect(self._approve_one)
+        btn_approve_all.clicked.connect(self._approve_all)
+        btn_close.clicked.connect(self.accept)
+        row.addWidget(btn_approve)
+        row.addWidget(btn_approve_all)
+        row.addWidget(btn_close)
+        layout.addLayout(row)
+
+    def _preview(self, item):
+        fl = item.data(Qt.UserRole)
+        if fl and fl.frames:
+            self.jump_cb(fl.frames[0], fl.track_id)
+
+    def _approve_one(self):
+        item = self.lst.currentItem()
+        if item is None:
+            return
+        fl = item.data(Qt.UserRole)
+        if fl is not None:
+            self.approve_cb(fl)
+            self.lst.takeItem(self.lst.row(item))
+
+    def _approve_all(self):
+        # Iterate from the bottom so row removal does not shift pending indices.
+        for r in range(self.lst.count() - 1, -1, -1):
+            it = self.lst.item(r)
+            fl = it.data(Qt.UserRole)
+            if fl is not None:
+                self.approve_cb(fl)
+                self.lst.takeItem(r)
+
+
 # ---------------------------------------------------------------------------
 # Triage dialog: confidence-ranked review queue + bulk accept + validation
 # ---------------------------------------------------------------------------

@@ -17,7 +17,8 @@ import pandas as pd
 import napari
 from magicgui.widgets import Container, PushButton, SpinBox, FloatSpinBox, Label, ComboBox, CheckBox
 from napari.utils.notifications import show_info, show_error
-from qtpy.QtWidgets import QFileDialog, QMessageBox, QScrollArea, QDialog
+from qtpy.QtWidgets import (QFileDialog, QMessageBox, QScrollArea, QDialog,
+                            QWidget, QVBoxLayout, QGroupBox)
 
 from . import config
 from .config import (
@@ -36,7 +37,8 @@ from .validated import CellValidation
 from .triage_review import TriageReview
 from .dialogs import TreatmentDialog
 from .tree_plot import lineage_tree_figure
-from .ui_panels import (DiagnosticsDialog, RelinkDialog, TriageDialog, SwapDialog,
+from .ui_panels import (DiagnosticsDialog, RelinkDialog, GapFillDialog,
+                        TriageDialog, SwapDialog,
                         LineageEditorDialog, CompareCellDialog)
 from .validation_dialog import ValidationDialog
 from . import triage as triage_mod
@@ -44,7 +46,8 @@ from . import validation as validation_mod
 
 
 def build_viewer(state, images, csv_path, mask_path, work_dir,
-                 treatment_config, thresholds: Thresholds, column_map):
+                 treatment_config, thresholds: Thresholds, column_map,
+                 channel_layers=None):
     """Construct and run the napari viewer around a CuratorState."""
     audit = AuditLog(work_dir)
     review = LineageReview(work_dir)
@@ -56,6 +59,21 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     viewer.add_image(images, name=LAYER_RAW, colormap="gray", blending="additive")
     labels_layer = viewer.add_labels(state.mask, name=LAYER_MASK, opacity=0.5)
     state.attach_mask_layer(labels_layer)
+
+    # Extra fluorescence channels: display-only image layers. They are added
+    # ABOVE the raw movie with additive blending so a reporter (Caspase-3, FUCCI,
+    # a viability dye) can be toggled on at the exact frame an anomaly is flagged.
+    # They are intentionally NOT registered in state, the ID pool, update_visuals
+    # or any save path -- they are read-only context, not segmentation. They
+    # start hidden so they never obscure the curation view until asked for.
+    channel_layer_names = []
+    for ch in (channel_layers or []):
+        try:
+            lyr = viewer.add_image(ch.data, name=ch.name, colormap=ch.colormap,
+                                   blending="additive", visible=False)
+            channel_layer_names.append(lyr.name)
+        except Exception as exc:
+            show_error(f"Could not add channel '{ch.name}': {exc}")
     focus_active = {"on": False}
     # Lineage-focus view: like focus mode, but highlights the WHOLE family
     # (root ancestor + every descendant) of the selected cell. ``ids`` caches
@@ -399,6 +417,9 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     btn_diagnose = PushButton(text="Open diagnostics panel")
     btn_triage = PushButton(text="Open triage queue (large datasets)")
     btn_relink = PushButton(text="Assisted gap relinking")
+    gap_method = ComboBox(name="GapMethod", label="Gap predictor:",
+                          choices=["linear", "spline"], value="spline")
+    btn_fill_gaps = PushButton(text="Fill gaps (interpolate trajectory)")
     btn_swaps = PushButton(text="Detect identity swaps (no jump)")
     btn_morph = PushButton(text="Detect segmentation errors (morphology)")
     btn_export_cell = PushButton(text="Export cell [A] video")
@@ -852,7 +873,8 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
 
     @btn_relink.clicked.connect
     def _relink():
-        sugs = lineage.suggest_relinks(state.df, thresholds)
+        method = gap_method.value
+        sugs = lineage.suggest_relinks(state.df, thresholds, method=method)
         if not sugs:
             return show_info("No gap-relink suggestions found.")
 
@@ -861,6 +883,23 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
 
         dlg = RelinkDialog(None, state, sugs, jump_to, approve)
         open_dialogs["relink"] = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    @btn_fill_gaps.clicked.connect
+    def _fill_gaps():
+        method = gap_method.value
+        fills = lineage.suggest_gap_fills(state.df, thresholds, method=method)
+        if not fills:
+            return show_info("No fillable gaps found (within the length limit).")
+
+        def approve(fl):
+            finish(ops.fill_gap(state, fl, treatment_config),
+                   "fill_gap", [fl.track_id])
+
+        dlg = GapFillDialog(None, state, fills, jump_to, approve)
+        open_dialogs["gapfill"] = dlg
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -1059,6 +1098,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     pixel_size_input = FloatSpinBox(label="Pixel size (um/px):", value=1.0, min=0.0001, step=0.05)
     frame_interval_input = FloatSpinBox(label="Frame interval (min/frame):", value=1.0, min=0.0001, step=0.5)
     exclude_border_cb = CheckBox(label="Exclude border-touching points", value=False)
+    exclude_interp_cb = CheckBox(label="Exclude interpolated (gap-filled) frames", value=False)
     export_window = SpinBox(label="Window for accumulated export:", value=7, min=2, max=1000)
     btn_nma = PushButton(text="Plot NMA (Area vs NII, per cell-frame)")
     btn_compare = PushButton(text="Compare cell [A] vs dataset (by group)")
@@ -1164,10 +1204,21 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         custom_group.value = "(none)"
 
     def stats_df():
-        """The dataframe statistics should use, honoring the border-exclusion box."""
+        """The dataframe statistics should use, honoring the filter checkboxes.
+
+        Two independent, composable filters: border-touching rows (partial
+        measurements) and interpolated rows (gap-filled centroids with no real
+        segmentation). Toggling the interpolated box lets you generate the same
+        centroid-based figure (migration, MSD, directionality) with and without
+        the synthesized frames, straight from the panel.
+        """
+        from .config import COL_INTERPOLATED
+        df = state.df
         if exclude_border_cb.value:
-            return analysis.exclude_border_rows(state.df)
-        return state.df
+            df = analysis.exclude_border_rows(df)
+        if exclude_interp_cb.value and COL_INTERPOLATED in df.columns:
+            df = df[~df[COL_INTERPOLATED].fillna(False).astype(bool)]
+        return df
 
     def get_summary():
         return analysis.compute_track_summary(
@@ -1376,6 +1427,37 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
 
     _bind("f", _focus)
     _bind("Shift-F", _lineage_focus)
+
+    # Fluorescence channels: `v` toggles the visibility of the extra channel
+    # layers as a group (off->on->off) at the current frame, so a reporter can be
+    # flashed on to confirm a flagged event without leaving the canvas. With more
+    # than one channel, Shift+V cycles which single channel is shown solo.
+    _chan_state = {"idx": -1}  # -1 = all hidden; >=0 = that channel solo
+
+    def _toggle_channels():
+        if not channel_layer_names:
+            return show_info("No extra fluorescence channels loaded.")
+        any_visible = any(viewer.layers[n].visible for n in channel_layer_names
+                          if n in viewer.layers)
+        for n in channel_layer_names:
+            if n in viewer.layers:
+                viewer.layers[n].visible = not any_visible
+        _chan_state["idx"] = -1
+        show_info("Fluorescence channels " + ("hidden." if any_visible else "shown."))
+
+    def _cycle_channels():
+        if not channel_layer_names:
+            return show_info("No extra fluorescence channels loaded.")
+        _chan_state["idx"] = (_chan_state["idx"] + 1) % len(channel_layer_names)
+        sel = _chan_state["idx"]
+        for i, n in enumerate(channel_layer_names):
+            if n in viewer.layers:
+                viewer.layers[n].visible = (i == sel)
+        show_info(f"Channel solo: {channel_layer_names[sel]}.")
+
+    _bind("v", _toggle_channels)
+    _bind("Shift-V", _cycle_channels)
+
     _bind(".", _next_unreviewed)
     _bind(",", _skip)
     _bind("Control-S", on_save)
@@ -1383,40 +1465,145 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     # ==================================================================
     # PANELS
     # ==================================================================
-    curation_panel = Container(widgets=[
-        instruction, progress_label, id_a_input, id_b_input, flag_filter,
-        lbl_setup, btn_treatment,
-        lbl_view, btn_focus, btn_tracks, btn_lineage_focus, lineage_progress,
-        btn_lineage_reviewed, btn_next_unreviewed,
-        btn_skip_single, btn_shuffle, btn_undo,
-        lbl_curation, btn_merge, btn_swap_future, btn_swap_local, btn_new_track,
-        btn_sync_frame, btn_sync_all, btn_harmonize, btn_delete, btn_delete_track, btn_rescue, btn_autotrack,
-        lbl_flags, btn_flag_mitosis, btn_flag_exit, btn_flag_death, btn_flag_ambiguous, btn_flag_clear,
-        lbl_lineage, btn_link_parent, btn_lineage_editor, btn_resequence_tree, btn_cut_ghosts, btn_tree_plot,
-        tree_max_families, tree_include_singles, btn_validate,
-        lbl_diag, btn_diagnose, btn_triage, btn_relink, btn_swaps, btn_morph, btn_export_cell, btn_export_video, btn_save,
-    ])
+    # The panel is long (40+ tools). Instead of a flat column separated by faint
+    # text labels, the tools are grouped into titled, collapsible sections so the
+    # ones you are not using can be folded away. Each section is still its own
+    # magicgui Container (so input labels like "ID [A]:" are preserved and no
+    # button is recreated or re-wired); the Container is only wrapped in a
+    # collapsible box. superqt's QCollapsible ships with napari; if it is somehow
+    # missing we fall back to a plain titled QGroupBox (no folding, still grouped).
+    _section_refs = []  # keep Container wrappers alive past GC
 
-    stats_panel = Container(widgets=[
-        lbl_stats, pixel_size_input, frame_interval_input, exclude_border_cb,
-        export_window, btn_nma, btn_compare,
-        btn_stats_lifetime, btn_stats_migration, btn_stats_motility, btn_stats_area, btn_stats_growth,
-        btn_stats_outcomes, btn_stats_division, btn_stats_msd, btn_stats_export,
-        lbl_gradient, gradient_value, gradient_group, btn_gradient,
-        lbl_traj, traj_mode, traj_y, traj_window_kind, traj_window, traj_smooth,
-        traj_maxtracks, traj_labels, btn_traj,
-        lbl_custom, custom_source, custom_x, custom_y, custom_group, custom_kind,
-        custom_agg, custom_legend, btn_custom,
-    ])
+    try:
+        from superqt import QCollapsible
+        _HAVE_COLLAPSIBLE = True
+    except Exception:
+        _HAVE_COLLAPSIBLE = False
+
+    def _section(title, widgets, collapsed=False):
+        inner = Container(widgets=widgets, labels=True)
+        _section_refs.append(inner)
+        try:
+            inner.native.layout().setContentsMargins(8, 6, 8, 6)
+        except Exception:
+            pass
+        if _HAVE_COLLAPSIBLE:
+            box = QCollapsible(title)
+            box.addWidget(inner.native)
+            # A slightly heavier, left-aligned header reads as a real section
+            # divider without shouting; keep it sober for a scientific tool.
+            try:
+                box.toggleButton().setStyleSheet(
+                    "text-align:left; border:none; outline:none;"
+                    "font-weight:600; padding:4px 2px;")
+                box.setDuration(120)
+            except Exception:
+                pass
+            (box.collapse if collapsed else box.expand)(animate=False)
+            return box
+        gb = QGroupBox(title)
+        lay = QVBoxLayout(gb)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.addWidget(inner.native)
+        return gb
+
+    def _build_panel(sections):
+        """Stack section boxes (each a QCollapsible/QGroupBox) into a scrollable column."""
+        host = QWidget()
+        col = QVBoxLayout(host)
+        col.setContentsMargins(4, 4, 4, 4)
+        col.setSpacing(6)
+        for box in sections:
+            col.addWidget(box)
+        col.addStretch(1)
+        return host
+
+    # ---- Curation tab ----
+    # A fixed header (selection + progress) stays visible above the sections so
+    # the [A]/[B] inputs are always reachable; only the tool groups fold.
+    curation_header = Container(widgets=[
+        instruction, progress_label, id_a_input, id_b_input, flag_filter], labels=True)
+    _section_refs.append(curation_header)
+    try:
+        curation_header.native.layout().setContentsMargins(8, 6, 8, 4)
+    except Exception:
+        pass
+
+    curation_sections = [
+        _section("SETUP", [btn_treatment], collapsed=True),
+        _section("NAVIGATION & VIEW",
+                 [btn_focus, btn_tracks, btn_lineage_focus, lineage_progress,
+                  btn_lineage_reviewed, btn_next_unreviewed, btn_skip_single,
+                  btn_shuffle, btn_undo]),
+        _section("BASIC CURATION",
+                 [btn_merge, btn_swap_future, btn_swap_local, btn_new_track,
+                  btn_sync_frame, btn_sync_all, btn_harmonize, btn_delete,
+                  btn_delete_track, btn_rescue, btn_autotrack]),
+        _section("OUTCOME FLAGS (on ID [A])",
+                 [btn_flag_mitosis, btn_flag_exit, btn_flag_death,
+                  btn_flag_ambiguous, btn_flag_clear]),
+        _section("LINEAGE / GENEALOGY",
+                 [btn_link_parent, btn_lineage_editor, btn_resequence_tree,
+                  btn_cut_ghosts, btn_tree_plot, tree_max_families,
+                  tree_include_singles, btn_validate]),
+        _section("DIAGNOSTICS & EXPORT",
+                 [btn_diagnose, btn_triage, btn_relink, gap_method, btn_fill_gaps,
+                  btn_swaps, btn_morph, btn_export_cell, btn_export_video, btn_save],
+                 collapsed=True),
+    ]
+    curation_host = QWidget()
+    _clay = QVBoxLayout(curation_host)
+    _clay.setContentsMargins(4, 4, 4, 4)
+    _clay.setSpacing(6)
+    _clay.addWidget(curation_header.native)
+    for box in curation_sections:
+        _clay.addWidget(box)
+    _clay.addStretch(1)
+
+    # ---- Statistics tab ----
+    # Calibration + filters stay visible (they affect every plot); the plot
+    # groups fold. The advanced plot builders start collapsed.
+    stats_header = Container(widgets=[
+        pixel_size_input, frame_interval_input, exclude_border_cb,
+        exclude_interp_cb, export_window], labels=True)
+    _section_refs.append(stats_header)
+    try:
+        stats_header.native.layout().setContentsMargins(8, 6, 8, 4)
+    except Exception:
+        pass
+
+    stats_sections = [
+        _section("QUICK STATISTICS",
+                 [btn_nma, btn_compare, btn_stats_lifetime, btn_stats_migration,
+                  btn_stats_motility, btn_stats_area, btn_stats_growth,
+                  btn_stats_outcomes, btn_stats_division, btn_stats_msd,
+                  btn_stats_export]),
+        _section("TEMPORAL GRADIENT",
+                 [gradient_value, gradient_group, btn_gradient], collapsed=True),
+        _section("TRAJECTORY PLOTS",
+                 [traj_mode, traj_y, traj_window_kind, traj_window, traj_smooth,
+                  traj_maxtracks, traj_labels, btn_traj], collapsed=True),
+        _section("CUSTOM PLOT",
+                 [custom_source, custom_x, custom_y, custom_group, custom_kind,
+                  custom_agg, custom_legend, btn_custom], collapsed=True),
+    ]
+    stats_host = QWidget()
+    _slay = QVBoxLayout(stats_host)
+    _slay.setContentsMargins(4, 4, 4, 4)
+    _slay.setSpacing(6)
+    _slay.addWidget(stats_header.native)
+    for box in stats_sections:
+        _slay.addWidget(box)
+    _slay.addStretch(1)
 
     curation_scroll = QScrollArea()
     curation_scroll.setWidgetResizable(True)
-    curation_scroll.setWidget(curation_panel.native)
+    curation_scroll.setWidget(curation_host)
     curation_scroll.setMinimumWidth(380)
 
     stats_scroll = QScrollArea()
     stats_scroll.setWidgetResizable(True)
-    stats_scroll.setWidget(stats_panel.native)
+    stats_scroll.setWidget(stats_host)
     stats_scroll.setMinimumWidth(380)
 
     viewer.window.add_dock_widget(curation_scroll, name="Curation tools", area="right")

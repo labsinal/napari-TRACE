@@ -37,6 +37,11 @@ COL_BORDER = "at_border"
 # time and recomputed at save time so it always reflects the curated mask.
 # Conversion to physical units (um^2) is applied in statistics via pixel size.
 COL_AREA = "area_px"
+# True for per-frame rows whose centroid was SYNTHESIZED to bridge a tracking
+# gap (see lineage.suggest_gap_fills / curation_ops.fill_gap). These rows have a
+# position but no mask, so area/morphometry are absent for them; statistics that
+# need a real segmentation can exclude them via this flag.
+COL_INTERPOLATED = "interpolated"
 
 INTERNAL_NUMERIC_COLS = (COL_TRACK, COL_FRAME, COL_X, COL_Y)
 

@@ -618,6 +618,55 @@ def apply_relink(state, suggestion):
 
 
 # ---------------------------------------------------------------------------
+# Apply an approved gap FILL (synthesize interpolated centroid rows)
+# ---------------------------------------------------------------------------
+def fill_gap(state, gapfill, treatment_config):
+    """Insert synthesized centroid rows for the frames a track was missing.
+
+    Unlike :func:`apply_relink`, this does not touch the mask or any other
+    track: it adds rows for ``gapfill.track_id`` at each missing frame with the
+    predicted (x, y), marked ``interpolated=True`` so statistics can tell a real
+    detection from a bridged one. Existing rows for that (track, frame) are left
+    alone (no duplicates created). The dataframe-only change snapshots no mask
+    planes.
+    """
+    from .config import COL_INTERPOLATED
+    frames = list(gapfill.frames)
+    if not frames:
+        return OpResult(False, "Nothing to fill: empty gap.")
+    state.save_state(frames=[], label="fill gap (interpolate)")
+    df = state.df
+    if COL_INTERPOLATED not in df.columns:
+        df[COL_INTERPOLATED] = False
+
+    tid = int(gapfill.track_id)
+    existing = set(df[(df[COL_TRACK] == tid) &
+                      (df[COL_FRAME].isin(frames))][COL_FRAME].tolist())
+    # Inherit the track's parent so the synthesized stretch keeps its lineage.
+    par = df.loc[df[COL_TRACK] == tid, COL_PARENT]
+    par = par[par > 0]
+    parent = int(par.iloc[0]) if not par.empty else -1
+
+    new_rows = []
+    for f, (x, y) in zip(frames, gapfill.xy):
+        if int(f) in existing:
+            continue
+        new_rows.append({
+            COL_FRAME: int(f), COL_TRACK: tid, COL_X: float(x), COL_Y: float(y),
+            COL_CLABEL: tid, COL_OUTCOME: "", COL_PARENT: parent,
+            COL_TREATMENT: _treatment_label(f, treatment_config),
+            COL_INTERPOLATED: True,
+        })
+    if not new_rows:
+        return OpResult(False, f"Track {tid}: those frames already exist.")
+    df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    df[COL_INTERPOLATED] = df[COL_INTERPOLATED].fillna(False).astype(bool)
+    state.df = df.sort_values([COL_TRACK, COL_FRAME]).reset_index(drop=True)
+    return OpResult(True, f"Filled {len(new_rows)} frame(s) of track {tid} "
+                          f"({gapfill.method} interpolation).")
+
+
+# ---------------------------------------------------------------------------
 # Auto-tracking with conflict resolution
 # ---------------------------------------------------------------------------
 def autotrack(state, a, treatment_config):

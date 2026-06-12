@@ -188,14 +188,125 @@ class RelinkSuggestion:
     distance: float
 
 
-def suggest_relinks(df: pd.DataFrame, thresholds: config.Thresholds
-                    ) -> list[RelinkSuggestion]:
+# ---------------------------------------------------------------------------
+# Trajectory prediction across a gap (linear or smoothing-spline)
+# ---------------------------------------------------------------------------
+# A long gap is exactly where a naive cubic spline misbehaves: forced through a
+# handful of noisy flanking centroids, an *interpolating* cubic overshoots and
+# can place the predicted centroid well outside the cell's real range (Runge
+# oscillation), giving a WORSE motility estimate than the linear baseline it is
+# meant to improve on. So the spline path here is deliberately conservative:
+#   * it fits a SMOOTHING spline (s > 0), not an interpolating one, so the curve
+#     follows the trend without chasing every jitter;
+#   * it uses points on BOTH sides of the gap when available, so the fill is
+#     anchored, not extrapolated into the void;
+#   * it falls back to straight linear interpolation when there are too few
+#     flanking points, when the gap is long relative to the surrounding data, or
+#     when scipy is unavailable; and
+#   * every predicted point is clamped to the bounding box of the flanking
+#     control points (plus a small margin), so a fit can never fling a centroid
+#     off-screen.
+# The window length (frames on each side) is the ``flank`` argument; the spec
+# asked for the last/next ~5 frames, which is the default.
+
+SPLINE_FLANK = 5            # frames of history used on each side of a gap
+SPLINE_SMOOTH_PER_PT = 2.0  # smoothing factor s = this * n_control_points
+SPLINE_MAX_GAP_FOR_SPLINE = 12   # gaps longer than this fall back to linear
+SPLINE_CLAMP_MARGIN_PX = 25.0    # predicted points may exceed the control bbox
+                                 # by at most this many px
+
+
+def _fit_axis_spline(frames, values, query_frames, smooth):
+    """Smoothing-spline fit of one coordinate vs frame, evaluated at queries.
+
+    Returns the predicted values, or ``None`` to signal the caller should fall
+    back to linear (too few points, or scipy missing). Never raises.
+    """
+    try:
+        from scipy.interpolate import UnivariateSpline
+    except Exception:
+        return None
+    n = len(frames)
+    if n < 4:
+        # A cubic smoothing spline needs k+1 = 4 points; below that, linear.
+        return None
+    # Degree is capped at 3 but reduced when there are few points.
+    k = min(3, n - 1)
+    try:
+        spl = UnivariateSpline(frames, values, k=k, s=float(smooth))
+        return spl(query_frames)
+    except Exception:
+        return None
+
+
+def predict_path(frames, xs, ys, query_frames, method="linear",
+                 flank=SPLINE_FLANK):
+    """Predict (x, y) at ``query_frames`` from a track's known points.
+
+    ``method`` is "linear" (piecewise-linear interpolation/extrapolation, the
+    original behaviour) or "spline" (clamped smoothing spline with a guaranteed
+    linear fallback). ``frames``/``xs``/``ys`` are the track's known samples
+    (need not be contiguous). Only the ``flank`` points nearest each side of the
+    queried span are used for the spline, so far-away history does not distort a
+    local fill. Returns ``(pred_x, pred_y)`` as float arrays the same length as
+    ``query_frames``.
+    """
+    frames = np.asarray(frames, dtype=float)
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    q = np.asarray(query_frames, dtype=float)
+    order = np.argsort(frames)
+    frames, xs, ys = frames[order], xs[order], ys[order]
+
+    # Linear baseline (also the fallback). np.interp holds the endpoints flat
+    # beyond the data, which for a bounded gap means honest interpolation.
+    lin_x = np.interp(q, frames, xs)
+    lin_y = np.interp(q, frames, ys)
+    if method != "spline":
+        return lin_x, lin_y
+
+    gap_len = float(q.max() - q.min()) + 1.0 if len(q) else 0.0
+    if gap_len > SPLINE_MAX_GAP_FOR_SPLINE:
+        return lin_x, lin_y
+
+    # Restrict to the flanking window on each side of the queried span.
+    lo, hi = q.min(), q.max()
+    before = np.flatnonzero(frames < lo)
+    after = np.flatnonzero(frames > hi)
+    keep = np.concatenate([before[-flank:], after[:flank]]).astype(int)
+    if keep.size < 4:
+        return lin_x, lin_y
+    fk, xk, yk = frames[keep], xs[keep], ys[keep]
+    smooth = SPLINE_SMOOTH_PER_PT * len(fk)
+
+    px = _fit_axis_spline(fk, xk, q, smooth)
+    py = _fit_axis_spline(fk, yk, q, smooth)
+    if px is None or py is None:
+        return lin_x, lin_y
+
+    # Clamp to the flanking bounding box (+ margin) so the fit can never throw a
+    # centroid off into nowhere; outside the box we trust the linear value more.
+    m = SPLINE_CLAMP_MARGIN_PX
+    xlo, xhi = xk.min() - m, xk.max() + m
+    ylo, yhi = yk.min() - m, yk.max() + m
+    bad = (px < xlo) | (px > xhi) | (py < ylo) | (py > yhi)
+    px = np.where(bad, lin_x, px)
+    py = np.where(bad, lin_y, py)
+    return px, py
+
+
+def suggest_relinks(df: pd.DataFrame, thresholds: config.Thresholds,
+                    method: str = "linear") -> list[RelinkSuggestion]:
     """For each track with a temporal gap, propose a reconnection candidate.
 
-    The expected position in the first missing frame is linearly extrapolated
-    from the track's last two known points. The best candidate is the nearest
-    *other* track present in that frame within ``relink_search_radius_px``.
-    The caller decides whether to approve each suggestion.
+    The expected position in the first missing frame is predicted from the
+    track's known points and the best candidate is the nearest *other* track
+    present in that frame within ``relink_search_radius_px``. ``method`` selects
+    the predictor: "linear" (last two points, the original behaviour) or
+    "spline" (a clamped smoothing spline over the flanking window, which follows
+    a curved trajectory better; see :func:`predict_path`). Only the predicted
+    position changes; candidate selection and approval are unchanged. The caller
+    decides whether to approve each suggestion.
     """
     suggestions: list[RelinkSuggestion] = []
     if df is None or df.empty:
@@ -225,13 +336,18 @@ def suggest_relinks(df: pd.DataFrame, thresholds: config.Thresholds
             gap_start = int(frames[gi])
             gap_end = int(frames[gi + 1])
             missing = gap_start + 1
-            # Linear extrapolation from the last two known points before the gap.
-            if gi >= 1:
-                vx = xs[gi] - xs[gi - 1]
-                vy = ys[gi] - ys[gi - 1]
+            if method == "spline":
+                ex_arr, ey_arr = predict_path(frames, xs, ys, [missing],
+                                              method="spline")
+                ex, ey = float(ex_arr[0]), float(ey_arr[0])
             else:
-                vx = vy = 0.0
-            ex, ey = xs[gi] + vx, ys[gi] + vy
+                # Linear extrapolation from the last two known points before the gap.
+                if gi >= 1:
+                    vx = xs[gi] - xs[gi - 1]
+                    vy = ys[gi] - ys[gi - 1]
+                else:
+                    vx = vy = 0.0
+                ex, ey = xs[gi] + vx, ys[gi] + vy
 
             best = None
             for cand_id, cx, cy in by_frame.get(missing, []):
@@ -247,6 +363,72 @@ def suggest_relinks(df: pd.DataFrame, thresholds: config.Thresholds
                     candidate_id=int(best[0]), candidate_xy=(best[1], best[2]),
                     distance=best[3]))
     return suggestions
+
+
+# ---------------------------------------------------------------------------
+# Gap FILLING: synthesize interpolated centroid rows in the missing frames
+# ---------------------------------------------------------------------------
+@dataclass
+class GapFill:
+    """A proposed set of synthesized rows that bridge one within-track gap.
+
+    Unlike a relink (which reconnects an *existing* candidate track across the
+    gap), a fill invents new per-frame centroid rows for the SAME track in the
+    frames where it vanished, so downstream motility/MSD sees a continuous path.
+    The rows carry no mask (there is no segmentation for an invented frame); they
+    are flagged via ``interpolated=True`` rows so they can be told apart.
+    """
+    track_id: int
+    gap_start: int                 # last real frame before the gap
+    gap_end: int                   # first real frame after the gap
+    frames: list                   # the missing frame indices to fill
+    xy: list                       # predicted (x, y) per missing frame
+    method: str                    # "linear" or "spline"
+
+
+def suggest_gap_fills(df: pd.DataFrame, thresholds: config.Thresholds,
+                      method: str = "spline",
+                      max_gap: int | None = None) -> list[GapFill]:
+    """Propose interpolated centroid rows for every within-track temporal gap.
+
+    For each track that disappears for one or more frames and reappears, predict
+    its centroid in the missing frames with :func:`predict_path` (spline by
+    default, falling back to linear as that function guarantees). Gaps longer
+    than ``max_gap`` are skipped (a very long disappearance is more likely a
+    genuine exit/re-entry than a tracking dropout worth inventing positions for).
+    Returns one :class:`GapFill` per bridged gap; the caller approves and applies.
+    """
+    fills: list[GapFill] = []
+    if df is None or df.empty:
+        return fills
+    d = df.dropna(subset=[COL_TRACK, COL_FRAME, COL_X, COL_Y]).copy()
+    if d.empty:
+        return fills
+    d[COL_TRACK] = d[COL_TRACK].astype(int)
+    d = d[d[COL_TRACK] > 0].sort_values([COL_TRACK, COL_FRAME])
+    if max_gap is None:
+        max_gap = SPLINE_MAX_GAP_FOR_SPLINE
+
+    for tid, g in d.groupby(COL_TRACK):
+        if config.is_quarantined_id(tid):
+            continue
+        frames = g[COL_FRAME].to_numpy(dtype=int)
+        xs = g[COL_X].to_numpy(dtype=float)
+        ys = g[COL_Y].to_numpy(dtype=float)
+        diffs = np.diff(frames)
+        gap_idx = np.flatnonzero(diffs > thresholds.gap_tolerance)
+        for gi in gap_idx:
+            gap_start = int(frames[gi])
+            gap_end = int(frames[gi + 1])
+            missing = list(range(gap_start + 1, gap_end))
+            if not missing or len(missing) > int(max_gap):
+                continue
+            px, py = predict_path(frames, xs, ys, missing, method=method)
+            xy = [(float(px[i]), float(py[i])) for i in range(len(missing))]
+            fills.append(GapFill(track_id=int(tid), gap_start=gap_start,
+                                 gap_end=gap_end, frames=missing, xy=xy,
+                                 method=method))
+    return fills
 
 
 # ---------------------------------------------------------------------------
