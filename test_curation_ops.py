@@ -4,7 +4,7 @@ Minimal runnable checks for the trickiest curation invariants.
 No pytest fixtures, no framework: plain asserts. Run either with
 ``pytest test_curation_ops.py`` or directly ``python test_curation_ops.py``.
 These are the guards a future refactor is most likely to break silently, not
-an exhaustive suite (ponytail: one runnable check, not a suite per function).
+an exhaustive suite: one runnable check per invariant, not a suite per function.
 Kept Qt-free by touching only curation_ops / lineage / state (pure pandas).
 """
 
