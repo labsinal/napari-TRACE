@@ -14,6 +14,16 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# The curator runs inside napari's Qt event loop, so matplotlib figures should
+# open in interactive Qt windows. Pin the Qt backend before any pyplot import
+# below pulls in a (possibly non-interactive) default, so every stats/preview
+# plot can actually be shown.
+import matplotlib
+try:
+    matplotlib.use("QtAgg", force=True)
+except Exception:
+    pass
+
 import napari
 from magicgui.widgets import Container, PushButton, SpinBox, FloatSpinBox, Label, ComboBox, CheckBox
 from napari.utils.notifications import show_info, show_error
@@ -30,6 +40,7 @@ from .config import (
     Thresholds,
 )
 from . import analysis, lineage, stats, curation_ops as ops, treatment as treat
+from . import fluorescence
 from . import exports
 from .audit import AuditLog
 from .review import LineageReview
@@ -66,8 +77,11 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     # They are intentionally NOT registered in state, the ID pool, update_visuals
     # or any save path -- they are read-only context, not segmentation. They
     # start hidden so they never obscure the curation view until asked for.
+    # Normalize to a mutable list so the in-app "Add channel" button can append
+    # to it and on_save / the measure export see the newly added channels.
+    channel_layers = list(channel_layers or [])
     channel_layer_names = []
-    for ch in (channel_layers or []):
+    for ch in channel_layers:
         try:
             lyr = viewer.add_image(ch.data, name=ch.name, colormap=ch.colormap,
                                    blending="additive", visible=False)
@@ -89,6 +103,62 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     # hook(action, ids, detail). Used by the validation pass to flag which
     # sampled cells were edited (i.e. where the automatic call was wrong).
     action_hooks = []
+
+    # Accumulated interactive fluorescence tables (ERK-KTR / 53BP1). Each is a
+    # per-(track,frame) DataFrame; on the next save they merge into features.
+    extra_feature_tables = []
+
+    def _image_layer_choices(widget=None):
+        return [ly.name for ly in viewer.layers
+                if ly.__class__.__name__ == "Image"]
+
+    def _channel_stack_by_name(name):
+        for ly in viewer.layers:
+            if ly.name == name and ly.__class__.__name__ == "Image":
+                return np.asarray(ly.data)
+        return None
+
+    # Background-ROI layer choices: "(auto)" plus any Labels/Shapes layer the user
+    # draws to mark a genuinely cell-free region (Labels or Shapes).
+    _ROI_AUTO = "(auto: non-cell median)"
+
+    def _roi_layer_choices(widget=None):
+        names = [ly.name for ly in viewer.layers
+                 if ly.__class__.__name__ in ("Labels", "Shapes")
+                 and ly.name != LAYER_MASK]
+        return [_ROI_AUTO] + names
+
+    def _roi_from_layer(name):
+        """Boolean cell-free ROI (H x W or T x H x W) from a Labels/Shapes layer.
+
+        Returns None for the "(auto)" choice so measure_intensity falls back to
+        the non-cell-median background.
+        """
+        if not name or name == _ROI_AUTO:
+            return None
+        h, w = state.mask.shape[-2:]
+        for ly in viewer.layers:
+            if ly.name != name:
+                continue
+            cls = ly.__class__.__name__
+            if cls == "Labels":
+                return np.asarray(ly.data) > 0
+            if cls == "Shapes":
+                try:
+                    masks = ly.to_masks(mask_shape=(h, w))
+                    return (np.any(masks, axis=0) if len(masks)
+                            else np.zeros((h, w), bool))
+                except Exception as exc:
+                    show_error(f"Could not read ROI from '{name}': {exc}")
+                    return None
+        return None
+
+    def _exports_dir_and_base():
+        """(exports_dir, csv_base_name), creating the exports dir if needed."""
+        import os
+        out_dir = os.path.join(work_dir, "exports")
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir, os.path.splitext(os.path.basename(csv_path))[0]
 
     # ------------------------------------------------------------------
     # Shared inputs
@@ -407,9 +477,8 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     lbl_lineage = Label(value="--- LINEAGE / GENEALOGY ---")
     btn_link_parent = PushButton(text="Link mother [A] -> daughter [B]  [l]")
     btn_lineage_editor = PushButton(text="Edit lineage of [A] (parent + daughters)")
-    btn_resequence_tree = PushButton(text="Re-sequence tree (1 -> 11, 12)")
     btn_cut_ghosts = PushButton(text="Cut post-mitosis ghosts")
-    btn_tree_plot = PushButton(text="Show lineage tree plot")
+    btn_tree_plot = PushButton(text="Show lineage tree plot (1.1, 1.2 labels)")
     tree_max_families = SpinBox(label="Tree: max families", value=60, min=1, max=100000)
     tree_include_singles = CheckBox(text="Tree: include single-cell families", value=False)
     btn_validate = PushButton(text="Validate lineage topology")
@@ -532,18 +601,6 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         for m in v.messages():
             print("LINEAGE VIOLATION:", m)
         show_error(f"{len(v.messages())} lineage violation(s); see console / diagnostics panel.")
-
-    @btn_resequence_tree.clicked.connect
-    def _reseq():
-        finish(ops.resequence_tree(state), "resequence")
-        # Re-sequencing renumbers lineage roots, so drop any reviewed marks that
-        # no longer correspond to an existing root, then refresh the indicator.
-        try:
-            review.prune(lineage.lineage_roots(state.df))
-        except Exception:
-            pass
-        _refresh_lineage_progress()
-        _update_reviewed_button()
 
     @btn_cut_ghosts.clicked.connect
     def _ghosts(): finish(ops.cut_ghosts(state), "cut_ghosts")
@@ -1074,13 +1131,19 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
             triage_review.prune(existing)
             review.prune(lineage.lineage_roots(state.df))
             base = os.path.splitext(os.path.basename(csv_path))[0]
+            marked = {L.name: np.asarray(L.data) for L in (channel_layers or [])
+                      if getattr(L, "measure", False)}
             res = exports.write_all(
                 work_dir, state.df, state.mask,
                 reviewed_roots=review.reviewed_roots(),
                 validated_cells=cellval.ids(),
                 base_name=base, window=int(export_window.value),
                 pixel_size=pixel_size_input.value,
-                frame_interval=frame_interval_input.value)
+                frame_interval=frame_interval_input.value,
+                channels=marked or None,
+                ring_opts={"dilation": int(ring_dilation.value),
+                           "gap": int(ring_gap.value)},
+                extra_tables=list(extra_feature_tables) or None)
             audit.record("export_tables",
                          detail=f"{len(res['files'])} tables, "
                                 f"{res['n_validated_tracks']} validated tracks -> {res['dir']}")
@@ -1100,6 +1163,160 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     exclude_border_cb = CheckBox(label="Exclude border-touching points", value=False)
     exclude_interp_cb = CheckBox(label="Exclude interpolated (gap-filled) frames", value=False)
     export_window = SpinBox(label="Window for accumulated export:", value=7, min=2, max=1000)
+
+    # --- Fluorescence: ring params, preview, ERK-KTR, 53BP1 ---
+    ring_dilation = SpinBox(label="Cytoplasm ring width (px):", value=2, min=1, max=20)
+    ring_gap = SpinBox(label="Ring gap from nucleus (px):", value=1, min=0, max=10)
+    # Two explicit channel roles so both can be set at once: the cytoplasm/reporter
+    # channel drives ERK-KTR C/N and the ring preview; the nucleus channel drives
+    # the 53BP1 nuclear-texture measure. Each button uses the right one.
+    cyto_channel = ComboBox(label="Cytoplasm channel (ERK-KTR):",
+                            choices=_image_layer_choices)
+    nuc_channel = ComboBox(label="Nucleus channel (53BP1):",
+                           choices=_image_layer_choices)
+    bg_roi_layer = ComboBox(label="Background ROI (cell-free):", choices=_roi_layer_choices)
+    btn_add_channel = PushButton(text="Add fluorescence channel...")
+    btn_ring_preview = PushButton(text="Preview ring on a random nucleus")
+
+    # Keep the channel/ROI dropdowns in sync as the user adds/removes layers
+    # (e.g. draws a Shapes layer for the background ROI, or adds a channel).
+    def _refresh_layer_combos(event=None):
+        for cb in (cyto_channel, nuc_channel, bg_roi_layer):
+            try:
+                cb.reset_choices()
+            except Exception:
+                pass
+    viewer.layers.events.inserted.connect(_refresh_layer_combos)
+    viewer.layers.events.removed.connect(_refresh_layer_combos)
+
+    def _add_channel():
+        """Load an extra channel (stack file OR per-frame folder), persist it into
+        the working copy, tag it, add it as a layer, and record it for reuse."""
+        import os
+        import shutil
+        import tifffile
+        from .channels import ChannelLayer
+        from .dialogs import ChannelConfigDialog, apply_channel_config
+        from . import io_adapters, data_io as _dio
+        choice = QMessageBox.question(
+            None, "Channel source",
+            "Select a folder of individual TIF frames?\n"
+            "(No = select a single TIF stack file)",
+            QMessageBox.Yes | QMessageBox.No)
+        if choice == QMessageBox.Yes:
+            path = QFileDialog.getExistingDirectory(
+                None, "Select channel frames folder", work_dir)
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                None, "Select channel TIF stack", work_dir, "TIFF (*.tif *.tiff)")
+        if not path:
+            return
+        base = os.path.splitext(os.path.basename(path.rstrip("/\\")))[0]
+        try:
+            if os.path.isdir(path):
+                saved_file = base + "_stack.tif"
+                dest = os.path.join(work_dir, saved_file)
+                arr = io_adapters.build_stack_from_folder(path, dest)
+            else:
+                saved_file = os.path.basename(path)
+                dest = os.path.join(work_dir, saved_file)
+                if os.path.abspath(path) != os.path.abspath(dest):
+                    shutil.copy2(path, dest)
+                arr = tifffile.imread(dest)
+        except Exception as exc:
+            return show_error(f"Could not load channel: {exc}")
+
+        n_frames = state.mask.shape[0]
+        ch_frames = arr.shape[0] if getattr(arr, "ndim", 0) >= 3 else 1
+        if ch_frames != n_frames:
+            show_error(f"Note: channel has {ch_frames} frames, movie has "
+                       f"{n_frames}; overlay/measures may be misaligned.")
+
+        layer_obj = ChannelLayer(name=base, data=arr, colormap="green")
+        dlg = ChannelConfigDialog([layer_obj])
+        if dlg.exec_() == QDialog.Accepted:
+            apply_channel_config([layer_obj], dlg.get_config())
+        try:
+            viewer.add_image(layer_obj.data, name=layer_obj.name,
+                             colormap=layer_obj.colormap, blending="additive",
+                             visible=True)
+        except Exception as exc:
+            return show_error(f"Could not add channel layer: {exc}")
+        channel_layers.append(layer_obj)
+        _dio.add_channel_to_meta(work_dir, layer_obj.name, saved_file,
+                                 color=layer_obj.colormap, measure=layer_obj.measure)
+        _refresh_layer_combos()
+        show_info(f"Channel '{layer_obj.name}' added and saved to the working "
+                  f"folder (reloads automatically next session).")
+    btn_add_channel.clicked.connect(_add_channel)
+
+    def _ring_preview():
+        # Preview the ring geometry over the cytoplasm channel (fallback: nucleus).
+        name = cyto_channel.value or nuc_channel.value
+        stack = _channel_stack_by_name(name)
+        try:
+            fig = fluorescence.ring_preview_figure(
+                state.mask, stack, track_id=None,
+                dilations=tuple(range(1, int(ring_dilation.value) + 1)) or (1,),
+                gap=int(ring_gap.value))
+            stats.show(fig)
+        except Exception as exc:
+            show_error(f"Ring preview failed: {exc}")
+    btn_ring_preview.clicked.connect(_ring_preview)
+
+    btn_erk = PushButton(text="Compute ERK-KTR C/N (cytoplasm channel -> features)")
+    btn_53bp1 = PushButton(text="Measure 53BP1 nuclear texture (nucleus channel -> features)")
+
+    def _erk_ktr():
+        name = cyto_channel.value
+        stack = _channel_stack_by_name(name)
+        if stack is None:
+            return show_error("Pick a valid Cytoplasm channel.")
+        df = fluorescence.measure_intensity(
+            stack, state.mask, channel_name=name,
+            dilation=int(ring_dilation.value), gap=int(ring_gap.value),
+            background_roi=_roi_from_layer(bg_roi_layer.value))
+        if df.empty:
+            return show_error("No cells measured.")
+        col = f"{name}_cn_ratio"
+        keep = df[["track_id", "frame", col]]
+        extra_feature_tables.append(keep)
+        import os
+        out_dir, base = _exports_dir_and_base()
+        keep.to_csv(os.path.join(out_dir, f"{base}_erk_ktr.csv"), index=False)
+        try:
+            fig = stats.custom_plot(keep, "frame", col, group_by="track_id",
+                                    kind="line", show_legend=False)
+            stats.show(fig)
+        except Exception:
+            pass
+        show_info(f"ERK-KTR C/N computed for {keep['track_id'].nunique()} cells; "
+                  f"added to next export.")
+    btn_erk.clicked.connect(_erk_ktr)
+
+    def _dsb_53bp1():
+        name = nuc_channel.value
+        stack = _channel_stack_by_name(name)
+        if stack is None:
+            return show_error("Pick a valid Nucleus channel.")
+        inten = fluorescence.measure_intensity(
+            stack, state.mask, channel_name=name,
+            dilation=int(ring_dilation.value), gap=int(ring_gap.value),
+            background_roi=_roi_from_layer(bg_roi_layer.value))
+        hara = fluorescence.haralick_features(stack, state.mask, channel_name=name)
+        cols = ["track_id", "frame", f"{name}_nuc_median", f"{name}_nuc_std"]
+        merged = inten[cols].merge(hara, on=["track_id", "frame"], how="left")
+        merged[f"{name}_nuc_cv"] = (
+            merged[f"{name}_nuc_std"] /
+            merged[f"{name}_nuc_median"].replace(0, np.nan))
+        extra_feature_tables.append(merged)
+        import os
+        out_dir, base = _exports_dir_and_base()
+        merged.to_csv(os.path.join(out_dir, f"{base}_53bp1.csv"), index=False)
+        show_info(f"53BP1 texture computed for {merged['track_id'].nunique()} cells; "
+                  f"added to next export.")
+    btn_53bp1.clicked.connect(_dsb_53bp1)
+
     btn_nma = PushButton(text="Plot NMA (Area vs NII, per cell-frame)")
     btn_compare = PushButton(text="Compare cell [A] vs dataset (by group)")
 
@@ -1139,7 +1356,11 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                      if pd.api.types.is_numeric_dtype(state.df[c])
                      and c not in (COL_TRACK, COL_FRAME)]
     _traj_ts_cols = (["area_px"] if "area_px" not in _traj_ts_cols else []) + _traj_ts_cols
-    _traj_ts_cols += ["perimeter", "circularity"] + list(analysis.NMA_COLS)
+    # Mask-derived columns computable on demand: perimeter/circularity, the NII
+    # morphometry and the shape descriptors (eccentricity, solidity, extent,
+    # orientation, axis lengths). Deduped against columns already in the table.
+    _extra_traj = ["perimeter", "circularity"] + list(analysis.MORPHOMETRY_COLS)
+    _traj_ts_cols += [c for c in _extra_traj if c not in _traj_ts_cols]
     traj_y = ComboBox(label="Quantity (Y):", choices=_traj_ts_cols,
                       value=_traj_ts_cols[0])
     traj_window_kind = ComboBox(label="Window metric:",
@@ -1543,7 +1764,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                  [btn_flag_mitosis, btn_flag_exit, btn_flag_death,
                   btn_flag_ambiguous, btn_flag_clear]),
         _section("LINEAGE / GENEALOGY",
-                 [btn_link_parent, btn_lineage_editor, btn_resequence_tree,
+                 [btn_link_parent, btn_lineage_editor,
                   btn_cut_ghosts, btn_tree_plot, tree_max_families,
                   tree_include_singles, btn_validate]),
         _section("DIAGNOSTICS & EXPORT",
@@ -1586,6 +1807,10 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         _section("CUSTOM PLOT",
                  [custom_source, custom_x, custom_y, custom_group, custom_kind,
                   custom_agg, custom_legend, btn_custom], collapsed=True),
+        _section("FLUORESCENCE",
+                 [btn_add_channel, cyto_channel, nuc_channel, bg_roi_layer,
+                  ring_dilation, ring_gap, btn_ring_preview,
+                  btn_erk, btn_53bp1], collapsed=True),
     ]
     stats_host = QWidget()
     _slay = QVBoxLayout(stats_host)

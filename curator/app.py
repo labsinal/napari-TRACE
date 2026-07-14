@@ -154,6 +154,40 @@ def main():
         if box.exec_() != QMessageBox.Yes:
             return print("Loading cancelled: image/mask mismatch.")
 
+    # -- mask <-> track_id correspondence: the whole tool assumes the mask's
+    # pixel value equals the row's track_id (clicks, focus and every mask-derived
+    # feature rely on it). When the mask is labelled differently, every
+    # mask-derived feature comes out NaN and curation acts on the wrong cells.
+    # Detect and offer to relabel the working copy so pixel value == track_id.
+    from . import analysis
+    import numpy as np
+    corr = analysis.mask_track_correspondence(df, masks)
+    if corr < 0.9:
+        box = QMessageBox(None)
+        box.setWindowTitle("Mask labels don't match the tracking table")
+        box.setIcon(QMessageBox.Warning)
+        box.setText(f"The mask's labels match the table's track_id for only "
+                    f"{corr * 100:.0f}% of cells.")
+        box.setInformativeText(
+            "The curator needs the mask painted with each cell's track_id -- "
+            "clicks, focus and every mask-derived feature (area, morphometry, "
+            "fluorescence) rely on it, otherwise those features are NaN.\n\n"
+            "Relabel the mask now so it matches the table? (Recommended. The "
+            "relabelled mask is written into the working copy; your original "
+            "folder is untouched.)")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.Yes)
+        if box.exec_() == QMessageBox.Yes:
+            masks, n = analysis.relabel_mask_to_track_ids(df, masks)
+            new_corr = analysis.mask_track_correspondence(df, masks)
+            try:
+                data_io.atomic_write_tif(masks.astype(np.uint32), mask_path)
+            except Exception as exc:
+                print(f"Relabelled in memory but could not rewrite the mask "
+                      f"file: {exc}")
+            print(f"Relabelled {n} mask blob(s) to match track_id "
+                  f"(correspondence {corr*100:.0f}% -> {new_corr*100:.0f}%).")
+
     # -- thresholds: data-derived by DEFAULT (the fixed 40px/20-frame values
     # mis-fire on higher-motility / shorter-track datasets). Pass
     # --no-auto-thresholds to force the fixed defaults.
@@ -178,7 +212,31 @@ def main():
 
     # -- extra fluorescence channels (display-only) --
     from . import channels as channels_mod
+    import tifffile as _tiff
     n_frames = images.shape[0] if getattr(images, "ndim", 0) >= 3 else 1
+
+    # Channels persisted in earlier sessions (added via the in-app "Add channel"
+    # button) reload automatically with their saved name/color/measure tags.
+    meta_layers = []
+    recorded_files = set()
+    for spec in data_io.meta_channels(work_dir):
+        fp = spec.get("file", "")
+        fp = fp if os.path.isabs(fp) else os.path.join(work_dir, fp)
+        recorded_files.add(os.path.abspath(fp))
+        if not os.path.exists(fp):
+            print(f"Recorded channel missing, skipping: {fp}")
+            continue
+        try:
+            arr = _tiff.imread(fp)
+        except Exception as exc:
+            print(f"Could not read recorded channel {fp}: {exc}")
+            continue
+        meta_layers.append(channels_mod.ChannelLayer(
+            name=spec.get("name") or os.path.splitext(os.path.basename(fp))[0],
+            data=arr, colormap=spec.get("color", "green"),
+            color=spec.get("color", "green"),
+            measure=bool(spec.get("measure", False))))
+
     channel_paths = list(args.channel or [])
     if not channel_paths:
         channel_paths = channels_mod.discover_channel_sources(
@@ -186,9 +244,23 @@ def main():
         if channel_paths:
             print(f"Auto-discovered {len(channel_paths)} extra channel(s): "
                   + ", ".join(os.path.basename(p) for p in channel_paths))
-    channel_layers = channels_mod.load_channel_sources(channel_paths, n_frames)
+    # Don't reload a channel that is already recorded in the meta.
+    channel_paths = [p for p in channel_paths
+                     if os.path.abspath(p) not in recorded_files]
+    disc_layers = channels_mod.load_channel_sources(channel_paths, n_frames)
+
+    # Only the freshly discovered/CLI layers go through the color/measure dialog;
+    # recorded layers already carry their saved tags.
+    if disc_layers:
+        from .dialogs import ChannelConfigDialog, apply_channel_config
+        cdlg = ChannelConfigDialog(disc_layers)
+        if cdlg.exec_() == QDialog.Accepted:
+            disc_layers = apply_channel_config(disc_layers, cdlg.get_config())
+
+    channel_layers = meta_layers + disc_layers
     if channel_layers:
-        print(f"Loaded {len(channel_layers)} fluorescence channel layer(s).")
+        print(f"Loaded {len(channel_layers)} fluorescence channel layer(s) "
+              f"({len(meta_layers)} recorded, {len(disc_layers)} discovered).")
 
     # Import the UI only now (after Qt + data are ready).
     from .ui import build_viewer

@@ -10,6 +10,7 @@ from __future__ import annotations
 from qtpy.QtWidgets import (
     QDialog, QComboBox, QFormLayout, QDialogButtonBox, QRadioButton,
     QSpinBox, QVBoxLayout, QGroupBox, QButtonGroup, QLabel,
+    QGridLayout, QLineEdit, QCheckBox,
 )
 
 from . import config
@@ -110,3 +111,55 @@ class TreatmentDialog(QDialog):
             return {"mode": TREAT_TREATED, "start": int(self.spin_start.value()),
                     "end": int(self.spin_end.value())}
         return {"mode": TREAT_CONTROL, "start": 0, "end": -1}
+
+
+CHANNEL_COLORS = ["green", "red", "blue", "magenta", "cyan", "yellow", "gray"]
+
+
+def apply_channel_config(layers, config):
+    """Apply a list of {name,color,measure} dicts onto ChannelLayer objects."""
+    for layer, cfg in zip(layers, config or []):
+        if cfg.get("name"):
+            layer.name = str(cfg["name"])
+        if cfg.get("color"):
+            layer.colormap = str(cfg["color"])
+            layer.color = str(cfg["color"])
+        layer.measure = bool(cfg.get("measure", False))
+    return layers
+
+
+class ChannelConfigDialog(QDialog):
+    """One row per extra channel: name, color, and a 'measure' checkbox."""
+
+    def __init__(self, layers, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Fluorescence channels")
+        self._layers = layers
+        self._rows = []
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Set each extra channel's display color and whether to measure "
+            "features from it (intensity + texture per cell)."))
+        grid = QGridLayout()
+        grid.addWidget(QLabel("<b>Channel</b>"), 0, 0)
+        grid.addWidget(QLabel("<b>Color</b>"), 0, 1)
+        grid.addWidget(QLabel("<b>Measure</b>"), 0, 2)
+        for i, L in enumerate(layers, start=1):
+            name = QLineEdit(L.name)
+            color = QComboBox(); color.addItems(CHANNEL_COLORS)
+            if L.colormap in CHANNEL_COLORS:
+                color.setCurrentText(L.colormap)
+            measure = QCheckBox()
+            grid.addWidget(name, i, 0)
+            grid.addWidget(color, i, 1)
+            grid.addWidget(measure, i, 2)
+            self._rows.append((name, color, measure))
+        layout.addLayout(grid)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_config(self):
+        return [{"name": n.text(), "color": c.currentText(),
+                 "measure": m.isChecked()} for n, c, m in self._rows]

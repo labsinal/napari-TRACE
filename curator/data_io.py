@@ -51,6 +51,33 @@ def write_meta(work_dir, meta):
         json.dump(meta, fh, indent=2)
 
 
+def meta_channels(work_dir):
+    """Return the list of persisted extra-channel specs recorded in the meta.
+
+    Each spec is a dict {name, file, color, measure}; ``file`` is relative to the
+    working directory. Channels added through the in-app "Add channel" button are
+    recorded here so they reload automatically in later sessions.
+    """
+    chans = read_meta(work_dir).get("channels", [])
+    return chans if isinstance(chans, list) else []
+
+
+def add_channel_to_meta(work_dir, name, filename, color="green", measure=False):
+    """Record (or update) one extra channel in the meta, keyed by file/name.
+
+    ``filename`` is the channel stack's name inside ``work_dir``. Returns the new
+    channel list. Preserves the rest of the metadata (source_folder, version).
+    """
+    meta = read_meta(work_dir)
+    chans = [c for c in meta.get("channels", [])
+             if c.get("file") != filename and c.get("name") != name]
+    chans.append({"name": str(name), "file": str(filename),
+                  "color": str(color), "measure": bool(measure)})
+    meta["channels"] = chans
+    write_meta(work_dir, meta)
+    return chans
+
+
 def setup_working_directory(source_folder):
     """Create a _curated sibling folder on first run; reuse it afterwards."""
     curated_name = os.path.basename(source_folder.rstrip("/\\")) + "_curated"
@@ -61,12 +88,19 @@ def setup_working_directory(source_folder):
         return work_dir, False
 
     os.makedirs(work_dir, exist_ok=True)
+    # Copy the whole source into the working copy -- BOTH top-level files (CSV,
+    # stacks) AND subfolders (per-frame TIF folders for the mask/image/extra
+    # channels). Copying only files left frame-folder inputs behind, so the
+    # working copy was missing channels and stacks lived next to the source.
     for fname in os.listdir(source_folder):
         src = os.path.join(source_folder, fname)
+        dst = os.path.join(work_dir, fname)
+        if os.path.exists(dst):
+            continue
         if os.path.isfile(src):
-            dst = os.path.join(work_dir, fname)
-            if not os.path.exists(dst):
-                shutil.copy2(src, dst)
+            shutil.copy2(src, dst)
+        elif os.path.isdir(src):
+            shutil.copytree(src, dst)
     write_meta(work_dir, {"source_folder": source_folder, "version": 6})
     return work_dir, True
 

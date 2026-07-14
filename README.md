@@ -40,9 +40,14 @@ validate that accepted batch with a random sample and an empirical error rate.
 
 - Overlay of raw video, segmentation mask, trajectories and ID labels in napari.
 - Optional extra **fluorescence channels** (apoptosis reporters such as cleaved
-  Caspase-3, cell-cycle indicators such as FUCCI, viability dyes) loaded as
-  display-only image layers you can flash on at the frame an anomaly is flagged,
-  to turn an "Ambiguous"/"Death" call into a biological one.
+  Caspase-3, cell-cycle indicators such as FUCCI, viability dyes, ERK-KTR,
+  53BP1) loaded as image layers, tagged at import with a display color and an
+  optional **measure** flag. Unmarked channels are display-only context you
+  flash on at the frame an anomaly is flagged, to turn an "Ambiguous"/"Death"
+  call into a biological one; marked channels are additionally passed through
+  the fluorescence engine to compute per-cell intensity, ratio and texture
+  features. The tracking mask is always the only segmentation — channels
+  never contribute to it, measured or not.
 - Identity fixes: merge, swap, cut, relabel, delete (single frame or whole track).
 - Mask reconciliation: sync the table to the mask, rescue orphan masks, split
   disconnected blobs, auto-track a single cell across the movie.
@@ -218,8 +223,8 @@ Three inputs from the same experiment (same frame count, same image size):
 
 **Optional — extra fluorescence channels.** Any number of additional channels
 (e.g. a cleaved-Caspase-3 apoptosis reporter, a FUCCI cell-cycle indicator, a
-viability dye) can be overlaid as display-only layers. Two storage conventions
-are accepted, and the tool handles either:
+viability dye, ERK-KTR, 53BP1) can be loaded alongside the movie. Two storage
+conventions are accepted, and the tool handles either:
 
 - **Separate files / folders, one per channel** — each its own TIF stack
   (T×H×W) or its own folder of per-frame TIFs. Auto-discovered inside the
@@ -229,9 +234,15 @@ are accepted, and the tool handles either:
 - **A single multi-channel TIF** — one stack carrying a channel axis (T×C×H×W
   or T×H×W×C); the channel axis is detected and split into one layer each.
 
-These channels are **never** treated as segmentation: they stay out of the
-mask, the ID pool, the tracking table and every save/export path. They are
-read-only context. They load hidden so they don't obscure the curation view;
+Each channel is tagged at import (the "Fluorescence channels" dialog) with a
+display **color** and an optional **measure** flag. These channels are
+**never** treated as segmentation — the single nuclear mask (the tracking
+mask) is always the segmentation, and channels stay out of the mask, the ID
+pool and the tracking table regardless of the measure flag. An unmarked
+channel is pure read-only context; a marked one is additionally passed
+through the fluorescence engine to produce per-cell intensity/ratio/texture
+columns in the export tables (see "Fluorescence channels & features" under
+Statistics tools). They load hidden so they don't obscure the curation view;
 toggle them with `v` (see shortcuts).
 
 If your CSV already has an outcome column (`outcome`, `fate`, ...) or a parent
@@ -242,9 +253,12 @@ column (`parent_id`, `mother_id`, ...), it is detected and preserved.
 ## The loading flow
 
 1. **Working copy.** On first open of a folder, a sibling folder
-   `<name>_curated` is created and all files are copied into it. Everything,
-   including saving, happens on that copy. Reopening the `_curated` folder
-   resumes the session (recognized via `curator_meta.json`).
+   `<name>_curated` is created and the whole source is copied into it — both
+   top-level files and subfolders (e.g. per-frame TIF folders for the mask,
+   image or extra channels). Everything, including saving and any derived
+   stacks, happens on that copy; the original folder is never modified.
+   Reopening the `_curated` folder resumes the session (recognized via
+   `curator_meta.json`).
 2. **File discovery.** The tool tries to find the CSV (names containing
    "track"), the mask (names containing "mask"/"label"/"seg") and the image (the
    remaining `.tif`). Anything it cannot resolve is requested through a dialog;
@@ -256,13 +270,20 @@ column (`parent_id`, `mother_id`, ...), it is detected and preserved.
 4. **Mismatch warning.** If image and mask differ in frame count or size you get
    a non-blocking warning. You can proceed, but area and centroid measurements
    will be wrong if the inputs are genuinely mismatched.
-5. **Automatic thresholds** (default). The anomaly thresholds are derived from
+5. **Mask ↔ track_id check.** The tool needs each cell's mask painted with its
+   `track_id` (clicks, focus and every mask-derived feature — area, morphometry,
+   fluorescence — rely on it). If the mask instead uses per-frame segmentation
+   labels, a dialog reports the low match and offers to relabel the mask (by each
+   row's centroid) so pixel value == `track_id`; the corrected mask is written
+   into the working copy. Declining leaves the mask as-is (mask-derived features
+   would be NaN).
+6. **Automatic thresholds** (default). The anomaly thresholds are derived from
    the data: the maximum per-frame jump is the 99.5th percentile of observed
    displacement times 1.5, and the minimum valid track length is 5% of the movie
    (never below 3 frames). Use `--no-auto-thresholds` for fixed values.
-6. **Treatment setup.** The "Treatment setup" dialog defines whether the movie is
+7. **Treatment setup.** The "Treatment setup" dialog defines whether the movie is
    all control or has a treatment window.
-7. **Automatic flags on load.** Before you touch anything: any track that is a
+8. **Automatic flags on load.** Before you touch anything: any track that is a
    parent of another is flagged Mitosis; a cell that touches the border and
    shrinks to nothing before the end is flagged Exit; legacy/foreign outcome
    labels are translated to the internal vocabulary. Automatic flags never
@@ -273,18 +294,19 @@ column (`parent_id`, `mother_id`, ...), it is detected and preserved.
 ## Core concepts
 
 **Layers.** `raw_video` (grayscale image), `cell_mask` (colored labels),
-`tracks` (trajectories), `ids` (numeric labels), plus one display-only image
-layer per extra fluorescence channel when supplied (hidden by default, toggled
-with `v`). Two side tabs: **Curation tools** and **Statistics**.
+`tracks` (trajectories), `ids` (numeric labels), plus one image layer per extra
+fluorescence channel when supplied (hidden by default, toggled with `v`). Two
+side tabs: **Curation tools** and **Statistics**.
 
 Within each tab the tools are grouped into **titled, collapsible sections**
 (SETUP, NAVIGATION & VIEW, BASIC CURATION, OUTCOME FLAGS, LINEAGE, DIAGNOSTICS &
 EXPORT on the curation tab; QUICK STATISTICS, TEMPORAL GRADIENT, TRAJECTORY
-PLOTS, CUSTOM PLOT on the statistics tab). Click a section title to fold or
-unfold it, so the groups you are not using stay out of the way. The selection
-inputs ([A]/[B], progress) and the statistics calibration/filters sit in a fixed
-header above the sections and are always visible. The rarely-used groups (SETUP,
-DIAGNOSTICS & EXPORT, and the advanced plot builders) start collapsed.
+PLOTS, CUSTOM PLOT, FLUORESCENCE on the statistics tab). Click a section title
+to fold or unfold it, so the groups you are not using stay out of the way. The
+selection inputs ([A]/[B], progress) and the statistics calibration/filters sit
+in a fixed header above the sections and are always visible. The rarely-used
+groups (SETUP, DIAGNOSTICS & EXPORT, and the advanced plot builders including
+FLUORESCENCE) start collapsed.
 
 **The two working IDs, [A] and [B].** Most operations act on one or two IDs in
 the input boxes. [A] is the primary target / mother; [B] is the destination /
@@ -523,19 +545,19 @@ flags of ID [A]" if needed.
 > two daughters you get the confirmation. Double-click daughter 12 to jump to it and
 > continue editing 12's own lineage.
 
-**Re-sequence tree (1 → 11, 12).** Renumbers all lineages by generation: the first
-family becomes 1, its daughters 11 and 12, granddaughters 111, 112, and so on.
-Families are numbered by order of appearance. Unrelated cells occupying target IDs
-are moved to quarantine. Run it at the end, before exporting, to get readable IDs.
-
 **Cut post-mitosis ghosts.** After a mother divides it should not continue to
 exist. This finds mothers still present from the frame a daughter was born and
 cuts that ghost segment to a new ID (clearing outcome and parent).
 
-**Show lineage tree plot.** Draws the genealogies, largest families first. Side
-controls set the maximum number of families (default 60) and whether to include
-single-cell families (flagged cells with no relatives, off by default). Very large
-trees are truncated to stay legible.
+**Show lineage tree plot.** Draws the genealogies, largest families first. Nodes
+are labelled with a readable genealogy path derived from `parent_id` — the first
+family is `1`, its daughters `1.1` and `1.2`, granddaughters `1.1.1`, `1.1.2`, and
+so on (ordered by birth frame), with the real `track_id` shown small underneath.
+This is a display-only translation: no IDs or masks are rewritten (so nothing can
+collide with the reserved ID ranges), and the labels always reflect the current
+lineage. Side controls set the maximum number of families (default 60) and whether
+to include single-cell families (flagged cells with no relatives, off by default).
+Very large trees are truncated to stay legible.
 
 **Validate lineage topology.** Reports biologically impossible configurations: a
 mother with more than two daughters, a daughter appearing at/before its mother, or
@@ -662,8 +684,20 @@ For both the full dataset and the **validated subset**, it writes:
 - `<base>_validated_cells.csv` — the main table restricted to validated tracks.
 - `<base>_features.csv` (+ `_validated`) — one row per (track, frame) with
   per-frame nuclear morphometry (area_px, perimeter, circularity, aspect,
-  area_box, radius_ratio, roundness, NII) and per-step migration (step
-  displacement, cumulative path, net-from-start, instantaneous speed).
+  area_box, radius_ratio, roundness, NII, plus shape descriptors eccentricity,
+  solidity, extent, orientation, axis_major_length, axis_minor_length),
+  per-step migration (step displacement, cumulative path, net-from-start,
+  instantaneous speed) and, for every **measured** fluorescence channel, its
+  per-compartment intensity/texture columns (see "Fluorescence channels &
+  features" under Statistics tools). Also carries a per-track **`lifetime`**
+  column (`(last_frame − first_frame + 1) × frame interval`) written on a single
+  row — the cell's **middle-of-life** frame — with NaN on every other row, so a
+  mean of the column gives one value per cell and survives trimming of the
+  first/last frames in a later cleanup.
+- `<base>_fluorescence.csv` (full dataset only, written when at least one
+  channel is marked "measure") — the same (track, frame) key restricted to
+  just the fluorescence columns, for quick loading without the rest of the
+  feature table.
 - `<base>_windows.csv` (+ `_validated`) — one row per (track, frame), with a
   **sliding window of N frames centred on that frame** (**N set by "Window for
   accumulated export", default 7**; clamped at track edges, so `n_frames` is
@@ -738,9 +772,11 @@ Each button works on the per-track summary (one row per cell), except where note
   indicates diffusive, sub- or super-diffusive motion.
 - **Export per-track summary (CSV)** — one row per cell with every computed metric
   (lifetime, total distance, net displacement, speed, directionality, mean/max
-  area, diffusion, persistence, turning angle, confinement, outcome, mitotic flag,
-  first/last frame, plus mean nuclear morphometry: `mean_nii` and the mean of
-  each component). This is the file you take to external analysis.
+  area, diffusion, persistence, turning angle, confinement, `anomalous_exponent`
+  (MSD power-law exponent: ~1 = normal diffusion, <1 = sub-, >1 = super-diffusive),
+  outcome, mitotic flag, first/last frame, plus mean nuclear morphometry:
+  `mean_nii` and the mean of each component). This is the file you take to
+  external analysis.
 
 ### Temporal-gradient boxplot
 
@@ -795,6 +831,75 @@ legend.
 > treatment, kind = scatter — shows whether longer-lived cells move slower, split
 > by treatment phase.
 
+### Fluorescence channels & features
+
+The **FLUORESCENCE** section (collapsed by default) drives the fluorescence
+engine: for each marked channel and (track, frame), intensity/texture are
+measured in three mask-derived compartments — **nuc** (the nuclear label
+itself), **ring** (a cytoplasm annulus around it) and **cell** (nuc + ring).
+The ring is grown outward from the nucleus and never overlaps the nucleus
+itself or a neighboring cell's nucleus, so a tightly packed field does not
+bleed one cell's signal into another's ring.
+
+- **Add fluorescence channel…** — load an extra channel without restarting: pick
+  a single TIF **stack** or a **folder of per-frame TIFs** (same as the mask and
+  image), tag its color and "measure" flag, and it is added as a layer and
+  **copied into the `_curated` working folder**, so it reloads automatically in
+  later sessions (recorded in `curator_meta.json`).
+- **Cytoplasm channel (ERK-KTR)** and **Nucleus channel (53BP1)** — two separate
+  pickers so both roles are selected at once. The ERK-KTR button and the ring
+  preview use the cytoplasm channel; the 53BP1 button uses the nucleus channel.
+- **Cytoplasm ring width (px)** (`dilation`) and **ring gap from nucleus (px)**
+  (`gap`) — the ring starts `gap` px outside the nuclear boundary and is
+  `dilation` px wide. Defaults are 2 px dilation, 1 px gap.
+- **Background ROI (cell-free)** — a picker listing any Labels or Shapes layer.
+  Leave it on `(auto: non-cell median)` to subtract the default per-frame
+  background, or draw a Labels/Shapes layer over a genuinely empty region and
+  select it to measure the background there instead (more accurate in confluent
+  fields, where "outside every nucleus" still contains cytoplasm). The
+  channel/ROI pickers refresh automatically as you add or remove layers.
+- **Preview ring on a random nucleus** — opens a small-multiples figure showing
+  the ring growing (dilation = 1, 2, 3, ...) on one real nucleus from the
+  movie, overlaid on the channel and with neighboring nuclei shaded, so you can
+  sanity-check the parameters against the actual cell density before running a
+  full measurement.
+- **Compute ERK-KTR C/N (cytoplasm channel → features)** — for the selected
+  **Cytoplasm channel**, computes the ring/nucleus (cytoplasm/nucleus) median
+  intensity ratio per (track, frame), plots it per track, adds it to the export
+  as `<channel>_cn_ratio`, and writes `<base>_erk_ktr.csv`. A high C/N indicates
+  active ERK signalling driving the KTR reporter out of the nucleus, per the
+  ERK-KTR ring/annulus convention (Regot et al. 2014; Kudo et al. 2018).
+- **Measure 53BP1 nuclear texture (nucleus channel → features)** — for the
+  selected **Nucleus channel**, computes nuclear median intensity, its standard
+  deviation and
+  coefficient of variation, plus the Haralick texture set, as a proxy for
+  DNA-damage (53BP1) foci graininess: a more textured (grainier) nucleus
+  indicates more/brighter foci than a uniformly diffuse one. Writes
+  `<base>_53bp1.csv`.
+
+Both buttons accumulate their result in memory and merge it into
+`<base>_features.csv` on the next **SAVE ALL**; they do not write to the main
+tracking table.
+
+Every per-compartment intensity statistic and the C/N ratio is
+**background-subtracted** first: a per-frame background is subtracted and
+clipped at zero. By default the background is the median intensity of pixels
+outside every cell in that frame; if a **Background ROI** layer is selected, the
+median inside that cell-free region is used instead. Haralick texture is
+computed on the raw (not background-subtracted) nuclear intensity, scaled by its
+own 1st/99th-percentile range.
+
+The columns produced for every marked channel, in `<base>_features.csv` /
+`<base>_fluorescence.csv`, are:
+
+- `<channel>_<compartment>_<stat>` for `compartment` in `nuc`/`ring`/`cell` and
+  `stat` in `mean`/`median`/`sum`/`min`/`max`/`std`/`p90`.
+- `<channel>_cn_ratio` — ring-median ÷ nucleus-median (the cytoplasm/nucleus
+  ratio used by KTR reporters).
+- `<channel>_hara_contrast` / `_correlation` / `_energy` / `_homogeneity` /
+  `_entropy` — Haralick texture (gray-level co-occurrence matrix, 16 gray
+  levels, averaged over 4 angles) computed on the nuclear ROI.
+
 ---
 
 ## Generated files
@@ -810,7 +915,7 @@ Everything lives inside the `<experiment>_curated` working folder:
 | `lineage_review.json` | Which lineages (by root) you marked reviewed. |
 | `cell_validation.json` | Which individual cells you confirmed in a validation sample. |
 | `triage_review.json` | Which triage-queue cells you ticked off as triaged. |
-| `exports/<base>_*.csv` | Derived tables written on SAVE ALL: `validated_cells`, `features`, `windows`, `summary`, each also as a `_validated` copy. |
+| `exports/<base>_*.csv` | Derived tables. On SAVE ALL: `validated_cells`, `features`, `windows`, `summary` (each also as a `_validated` copy), plus `fluorescence` when a channel is marked "measure". Written immediately by their buttons: `erk_ktr`, `53bp1` (see Fluorescence channels & features). |
 
 The saved CSV uses the internal schema (`track_id`, `frame`, `pos_x`, `pos_y`,
 `outcome`, `parent_id`, `continuous_label`, `treatment`, `at_border`, `area_px`)
@@ -847,9 +952,8 @@ and round-trips with the file.
   whole-movie sync iterate over every frame and, in places, row by row; they can
   take minutes on long movies with many cells. The trajectory layer is the
   heaviest to draw — set it to OFF if the screen freezes.
-- **Memory on full-movie operations.** Merge, exterminate, harmonize and
-  re-sequence snapshot the whole stack for undo; the history keeps the last 10
-  steps.
+- **Memory on full-movie operations.** Merge, exterminate and harmonize snapshot
+  the whole stack for undo; the history keeps the last 10 steps.
 - **Swap / cut clears outcomes** of the swapped segment from the cut point on. If
   you had already set an outcome there, set it again.
 - **The pre-save quality filter can delete tracks** if you choose "Remove and save
@@ -863,13 +967,20 @@ and round-trips with the file.
   hand, sync sees 21 disappear and 45 appear as unrelated, orphaning 21's
   daughters. To rename a cell and keep its lineage, use merge or relabel, which
   repoint the daughters.
+- **Genealogy labels are display-only.** The lineage tree shows readable paths
+  (`1.1.2`) derived from `parent_id` at plot time; the stored `track_id` is
+  unchanged. Datasets curated with the removed "Re-sequence tree" op may still
+  carry large baked-in IDs (up to 9 digits), which the reserved-range layout
+  accommodates; IDs beyond that are not expected.
 - **The mismatch warning does not block.** If you proceed with image and mask of
   different sizes, area and centroid measurements will be wrong.
 - **Extra channels are not checked for alignment.** A fluorescence channel whose
   frame count or size differs from the movie is still loaded (with a printed
-  warning), so a mismatched channel will overlay misaligned. They are display
-  only and never enter any measurement, so they cannot corrupt the data — but
-  trust the overlay only when the channel matches the movie.
+  warning), so a mismatched channel will overlay misaligned — and, if it is
+  marked "measure", its per-cell features will be measured against the wrong
+  frame/geometry too. Unmarked channels stay display-only and never enter any
+  measurement, so they cannot corrupt the data. Trust the overlay, and any
+  measured feature, only when the channel matches the movie.
 - **Channel-axis detection is heuristic.** For a single multi-channel TIF the
   channel axis is inferred (the small non-time, non-spatial axis). An unusual
   layout — e.g. a genuine channel count above 8, or a movie with very few frames

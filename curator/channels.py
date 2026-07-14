@@ -57,6 +57,12 @@ class ChannelLayer:
     name: str
     data: np.ndarray          # T x H x W (single channel)
     colormap: str
+    color: str = ""           # user-chosen tag (green/red/...); defaults to colormap
+    measure: bool = False     # compute per-cell fluorescence features for this channel
+
+    def __post_init__(self):
+        if not self.color:
+            self.color = self.colormap
 
     @property
     def n_frames(self) -> int:

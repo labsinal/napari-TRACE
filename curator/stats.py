@@ -520,14 +520,16 @@ def trajectories(df, mask=None, mode="timeseries", y_col=None,
                 raise ValueError("Perimeter/circularity need a mask.")
             d = d.merge(src[["frame", "track_id", col]],
                         on=["frame", "track_id"], how="left")
-        elif col in analysis.NMA_COLS:
-            src = analysis.nuclear_morphometry(mask)
-            if src.empty:
-                raise ValueError("Nuclear morphometry (NII) needs a mask.")
-            d = d.merge(src[["frame", "track_id", col]],
-                        on=["frame", "track_id"], how="left")
         elif col == "area_px":
             d = analysis.annotate_area(d, mask)
+        elif col in analysis.MORPHOMETRY_COLS:
+            # NII plus the shape descriptors (eccentricity, solidity, extent,
+            # orientation, axis lengths) -- all come from nuclear_morphometry.
+            src = analysis.nuclear_morphometry(mask)
+            if src.empty:
+                raise ValueError("Nuclear morphometry needs a mask.")
+            d = d.merge(src[["frame", "track_id", col]],
+                        on=["frame", "track_id"], how="left")
 
     if mode in ("timeseries", "cumulative") and y_col:
         _ensure_col(y_col)

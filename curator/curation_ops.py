@@ -549,59 +549,6 @@ def cut_ghosts(state):
 
 
 # ---------------------------------------------------------------------------
-# Re-sequence lineage tree (uses unified reserved ranges)
-# ---------------------------------------------------------------------------
-def resequence_tree(state):
-    state.save_state(full=True, label="re-sequence tree")
-    df = state.df
-    mask = state.mask
-    groups = lineage.classify_lineage(df)
-    children_of = groups.children_of
-    roots = groups.roots
-    if not roots:
-        return OpResult(False, "No lineage or flagged cell found to organize.")
-
-    new_id_map = {}
-
-    def build_ids(node, base_id):
-        new_id_map[node] = base_id
-        for idx, child in enumerate(children_of.get(node, []), start=1):
-            build_ids(child, int(str(base_id) + str(idx)))
-
-    ordered_roots = (df[df[COL_TRACK].isin(roots)]
-                     .groupby(COL_TRACK)[COL_FRAME].min().sort_values().index)
-    family_counter = 1
-    for r in ordered_roots:
-        build_ids(int(r), family_counter)
-        family_counter += 1
-
-    # Evict unrelated cells occupying target IDs into the quarantine range.
-    target_ids = set(new_id_map.values())
-    existing_ids = set(df[COL_TRACK].unique())
-    intruders = (existing_ids - set(new_id_map.keys())) & target_ids
-    if intruders:
-        for old in intruders:
-            safe = state.reserve_quarantine_id()
-            mask[mask == old] = safe
-            df.loc[df[COL_TRACK] == old, [COL_TRACK, COL_CLABEL]] = safe
-            df.loc[df[COL_PARENT] == old, COL_PARENT] = safe
-
-    # Apply new IDs through a transient offset to avoid clashes.
-    offset = config.RESEQ_OFFSET
-    for old_id, new_id in new_id_map.items():
-        mask[mask == old_id] = new_id + offset
-    for new_id in new_id_map.values():
-        mask[mask == new_id + offset] = new_id
-
-    total_map = dict(new_id_map)
-    df[COL_PARENT] = df[COL_PARENT].map(lambda x: total_map.get(int(x), x) if x > 0 else x)
-    df[COL_TRACK] = df[COL_TRACK].map(lambda x: total_map.get(int(x), x))
-    df[COL_CLABEL] = df[COL_TRACK]
-    state.df = df
-    return OpResult(True, "Lineage tree re-sequenced; families numbered.")
-
-
-# ---------------------------------------------------------------------------
 # Apply an approved relink suggestion
 # ---------------------------------------------------------------------------
 def apply_relink(state, suggestion):

@@ -176,14 +176,24 @@ SHORT_TAIL_LENGTH = 12
 #   [QUARANTINE_START  .. QUARANTINE_END)   evicted / orphaned cells (ignored by
 #                                           diagnostics, dropped on save)
 #   [RESEQ_OFFSET      .. ...)              transient offset used only *inside*
-#                                           the re-sequencing routine; never
+#                                           the mask<->track_id relabel; never
 #                                           persisted, never on disk.
 #
 # The pool's free-ID cursor only ever hands out IDs in [1, NORMAL_ID_MAX).
-NORMAL_ID_MAX = 1_000_000          # normal IDs live strictly below this
-QUARANTINE_START = 1_000_000       # evicted/orphan "graveyard" range start
-QUARANTINE_END = 2_000_000         # ... and end (exclusive)
-RESEQ_OFFSET = 10_000_000          # transient collision-avoidance offset
+#
+# The normal range is deliberately large (up to 9-digit IDs) for backward
+# compatibility: the old "Re-sequence tree" op (now replaced by display-only
+# genealogy labels -- see lineage.hierarchical_labels) numbered cells by
+# concatenating each generation's branch index (1 -> 11, 12 -> 111, ...), so
+# datasets curated with it may have 7-9 digit IDs baked into the table and mask.
+# Those must stay BELOW the quarantine range or a legitimate cell gets misread as
+# evicted and vanishes from the feature export. The whole layout stays under the
+# uint32 mask limit (2**32 ~ 4.29e9): the largest value ever put in the mask is a
+# normal id (< NORMAL_ID_MAX) plus RESEQ_OFFSET, i.e. < 3e9 < 4.29e9.
+NORMAL_ID_MAX = 1_000_000_000      # normal IDs live strictly below this (<=9 digits)
+QUARANTINE_START = 1_000_000_000   # evicted/orphan "graveyard" range start
+QUARANTINE_END = 1_500_000_000     # ... and end (exclusive)
+RESEQ_OFFSET = 2_000_000_000       # transient collision-avoidance offset (uint32-safe)
 
 
 def is_normal_id(value: int) -> bool:
@@ -216,8 +226,6 @@ class Thresholds:
     min_solidity: float = 0.85          # solidity below this -> concave/leaky mask
     max_eccentricity: float = 0.98      # eccentricity above this -> sliver/artefact
     # Mitosis lifetime sanity (used by diagnostics):
-    mitosis_life_lo: float = 0.5        # (legacy, unused) < median * lo
-    mitosis_life_hi: float = 1.5        # (legacy, unused) > median * hi
     mitosis_life_mad_k: float = 4.0     # flag if |life-median| > k*MAD (robust)
     # Assisted gap relinking:
     relink_search_radius_px: float = 60.0

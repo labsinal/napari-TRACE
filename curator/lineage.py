@@ -71,6 +71,41 @@ def classify_lineage(df: pd.DataFrame) -> LineageGroups:
     return LineageGroups(mothers, daughters, flagged_singles, children_of)
 
 
+def hierarchical_labels(df: pd.DataFrame) -> dict:
+    """Return {track_id: "1.2.1"}-style genealogy labels derived from parent_id.
+
+    Purely a *display* translation of the lineage already stored in the table:
+    family roots (ordered by first frame) are numbered 1, 2, 3 ...; each cell's
+    daughters (ordered by birth frame) get the parent's label with ".1", ".2"
+    appended. Nothing about the actual track_id or the mask changes -- this is
+    what the tree plot shows instead of raw IDs, so there is no need to rewrite
+    IDs (which used to risk colliding with the reserved ranges). Iterative, so a
+    very deep lineage cannot hit the recursion limit; cycle-safe.
+    """
+    if df is None or df.empty or COL_PARENT not in df:
+        return {}
+    groups = classify_lineage(df)
+    children_of = groups.children_of
+    firsts = _first_frames(df)
+
+    def _order(ids):
+        return sorted((int(i) for i in ids),
+                      key=lambda i: (firsts.get(i, 10**9), i))
+
+    labels: dict[int, str] = {}
+    for fam, root in enumerate(_order(groups.roots), start=1):
+        stack = [(root, str(fam))]
+        while stack:
+            node, label = stack.pop()
+            if node in labels:
+                continue
+            labels[node] = label
+            for idx, child in enumerate(_order(children_of.get(node, [])), start=1):
+                if child not in labels:
+                    stack.append((child, f"{label}.{idx}"))
+    return labels
+
+
 # ---------------------------------------------------------------------------
 # Topological validator
 # ---------------------------------------------------------------------------

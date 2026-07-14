@@ -32,7 +32,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from . import analysis, lineage
+from . import analysis, lineage, fluorescence
 from .config import (COL_TRACK, COL_FRAME, COL_X, COL_Y, COL_OUTCOME, COL_PARENT,
                      COL_TREATMENT, COL_BORDER, COL_AREA, is_quarantined_id)
 
@@ -80,7 +80,9 @@ def subset_tracks(df, track_ids):
 # ---------------------------------------------------------------------------
 # Per-frame feature table
 # ---------------------------------------------------------------------------
-def features_table(df, mask, pixel_size=1.0, frame_interval=1.0):
+def features_table(df, mask, pixel_size=1.0, frame_interval=1.0,
+                   channels=None, ring_opts=None, texture=True,
+                   extra_tables=None):
     """One row per (track, frame): morphometry + per-step migration."""
     if df is None or df.empty:
         return pd.DataFrame()
@@ -118,7 +120,58 @@ def features_table(df, mask, pixel_size=1.0, frame_interval=1.0):
         if not nm.empty:
             nm = nm.rename(columns={"track_id": COL_TRACK, "frame": COL_FRAME})
             out = out.merge(nm, on=[COL_TRACK, COL_FRAME], how="left")
-    return out.reset_index(drop=True)
+
+    # Per-channel fluorescence features (marked channels only), merged by cell/frame.
+    ropts = ring_opts or {}
+    dil = int(ropts.get("dilation", fluorescence.RING_DILATION_DEFAULT))
+    gap = int(ropts.get("gap", fluorescence.RING_GAP_DEFAULT))
+    for name, stack in (channels or {}).items():
+        inten = fluorescence.measure_intensity(stack, mask, channel_name=name,
+                                               dilation=dil, gap=gap)
+        if not inten.empty:
+            inten = inten.rename(columns={"track_id": COL_TRACK, "frame": COL_FRAME})
+            out = out.merge(inten, on=[COL_TRACK, COL_FRAME], how="left")
+        if texture:
+            hara = fluorescence.haralick_features(stack, mask, channel_name=name)
+            if not hara.empty:
+                hara = hara.rename(columns={"track_id": COL_TRACK, "frame": COL_FRAME})
+                out = out.merge(hara, on=[COL_TRACK, COL_FRAME], how="left")
+
+    # Interactive-readout tables (ERK-KTR, 53BP1) accumulated in the session.
+    for extra in (extra_tables or []):
+        if extra is None or extra.empty:
+            continue
+        e = extra.rename(columns={"track_id": COL_TRACK, "frame": COL_FRAME})
+        merge_cols = [c for c in (COL_TRACK, COL_FRAME) if c in e.columns]
+        if len(merge_cols) == 2:
+            dup = [c for c in e.columns if c in out.columns and c not in merge_cols]
+            e = e.drop(columns=dup)
+            out = out.merge(e, on=merge_cols, how="left")
+
+    out = out.reset_index(drop=True)
+    _add_lifetime_midframe(out, frame_interval)
+    return out
+
+
+def _add_lifetime_midframe(out, frame_interval=1.0):
+    """Add a per-track ``lifetime`` carried on the middle-of-life row only.
+
+    ``lifetime = (last_frame - first_frame + 1) * frame_interval`` is written on
+    the single (track, frame) row at the centre of the track's frames; every
+    other row is NaN. This gives exactly one value per cell for averaging, and
+    puts it away from the ends so trimming the first/last frames in a later
+    cleanup never drops it. Operates in place on ``out``.
+    """
+    out["lifetime"] = np.nan
+    if out.empty:
+        return out
+    for _tid, g in out.groupby(COL_TRACK):
+        g = g.sort_values(COL_FRAME)
+        frames = g[COL_FRAME].to_numpy(dtype=float)
+        lifetime = (frames.max() - frames.min() + 1) * frame_interval
+        mid_label = g.index[len(g) // 2]        # middle row in frame order
+        out.loc[mid_label, "lifetime"] = lifetime
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +266,8 @@ def _atomic_csv(frame, path):
 
 
 def write_all(work_dir, df, mask, reviewed_roots, validated_cells, base_name,
-              window=7, pixel_size=1.0, frame_interval=1.0):
+              window=7, pixel_size=1.0, frame_interval=1.0,
+              channels=None, ring_opts=None, extra_tables=None):
     """Write every derived table (full + validated) into ``work_dir/exports``.
 
     Returns a dict of {key: path} for the files written and the count of
@@ -224,7 +278,9 @@ def write_all(work_dir, df, mask, reviewed_roots, validated_cells, base_name,
 
     valid_ids = validated_track_ids(df, reviewed_roots, validated_cells)
 
-    features = features_table(df, mask, pixel_size, frame_interval)
+    features = features_table(df, mask, pixel_size, frame_interval,
+                              channels=channels, ring_opts=ring_opts,
+                              extra_tables=extra_tables)
     windows = windows_table(df, mask, window, pixel_size, frame_interval)
     summary = analysis.compute_track_summary(df, mask, pixel_size, frame_interval)
     validated_main = subset_tracks(df, valid_ids)
@@ -243,6 +299,13 @@ def write_all(work_dir, df, mask, reviewed_roots, validated_cells, base_name,
     written["summary"] = _atomic_csv(summary, p("summary"))
     written["summary_validated"] = _atomic_csv(
         subset_tracks(summary, valid_ids), p("summary_validated"))
+
+    if channels and features is not None and not features.empty:
+        chan_cols = [c for c in features.columns
+                     if any(c.startswith(f"{n}_") for n in channels)]
+        if chan_cols:
+            fl_only = features[[COL_TRACK, COL_FRAME] + chan_cols]
+            written["fluorescence"] = _atomic_csv(fl_only, p("fluorescence"))
     return {"files": {k: v for k, v in written.items() if v},
             "n_validated_tracks": len(valid_ids),
             "dir": out_dir}

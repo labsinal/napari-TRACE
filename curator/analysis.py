@@ -68,6 +68,88 @@ def areas_for_frame(mask_plane: np.ndarray, pixel_area: float = 1.0) -> dict[int
 
 
 # ---------------------------------------------------------------------------
+# Mask <-> track_id reconciliation
+# ---------------------------------------------------------------------------
+# The whole tool assumes the mask's pixel value equals the row's track_id: a
+# click reads the pixel value as the ID, focus highlights selected_label ==
+# track_id, and every mask-derived feature (area/morphometry/fluorescence) is
+# joined to the table by that equality. When a dataset's mask is labelled by
+# per-frame segmentation labels instead (the tracker stored the identity only in
+# the CSV), that equality is broken and every mask-derived feature comes out NaN
+# -- silently. These helpers detect the mismatch and repair it by relabelling the
+# mask so pixel value == track_id, keyed on each row's centroid.
+def mask_track_correspondence(df, mask) -> float:
+    """Fraction of table rows whose mask pixel at (round y, round x) == track_id.
+
+    1.0 means the mask is already labelled by track_id (the tool's assumption);
+    a low value means the mask uses different labels and must be reconciled.
+    Returns 1.0 for empty input (nothing to reconcile).
+    """
+    if df is None or df.empty or mask is None:
+        return 1.0
+    d = df.dropna(subset=[COL_TRACK, COL_FRAME, COL_X, COL_Y])
+    if d.empty:
+        return 1.0
+    h, w = mask.shape[-2:]
+    hits = total = 0
+    for f, g in d.groupby(d[COL_FRAME].astype(int)):
+        if f < 0 or f >= mask.shape[0]:
+            continue
+        plane = mask[f]
+        xs = g[COL_X].round().astype(int).to_numpy()
+        ys = g[COL_Y].round().astype(int).to_numpy()
+        tids = g[COL_TRACK].astype(int).to_numpy()
+        ok = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        for xi, yi, tid in zip(xs[ok], ys[ok], tids[ok]):
+            total += 1
+            if int(plane[yi, xi]) == int(tid):
+                hits += 1
+    return hits / total if total else 1.0
+
+
+def relabel_mask_to_track_ids(df, mask):
+    """Return (new_mask, n_relabeled): mask relabelled so pixel value == track_id.
+
+    For each frame the mask label found under each row's centroid is remapped to
+    that row's track_id. Remapping goes through a transient offset so a relabelled
+    value can never collide with an as-yet-unprocessed original label. Blobs with
+    no table row in a frame keep their original label (they are untracked objects;
+    Rescue orphans / the duplicate check handle them). Operates on a copy.
+    """
+    if df is None or df.empty or mask is None:
+        return mask, 0
+    d = df.dropna(subset=[COL_TRACK, COL_FRAME, COL_X, COL_Y])
+    if d.empty:
+        return mask, 0
+    new = mask.copy()
+    h, w = mask.shape[-2:]
+    off = config.RESEQ_OFFSET
+    n = 0
+    for f, g in d.groupby(d[COL_FRAME].astype(int)):
+        if f < 0 or f >= mask.shape[0]:
+            continue
+        plane = mask[f]
+        xs = g[COL_X].round().astype(int).to_numpy()
+        ys = g[COL_Y].round().astype(int).to_numpy()
+        tids = g[COL_TRACK].astype(int).to_numpy()
+        ok = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        mapping = {}
+        for xi, yi, tid in zip(xs[ok], ys[ok], tids[ok]):
+            lbl = int(plane[yi, xi])
+            if lbl > 0:
+                mapping[lbl] = int(tid)
+        if not mapping:
+            continue
+        out = new[f]
+        for old, newid in mapping.items():
+            out[plane == old] = newid + off
+        shifted = out >= off
+        out[shifted] -= off
+        n += len(mapping)
+    return new, n
+
+
+# ---------------------------------------------------------------------------
 # Unified anomaly detection
 # ---------------------------------------------------------------------------
 @dataclass
@@ -451,12 +533,16 @@ def motility_metrics(frames, xs, ys, frame_interval=1.0):
                            step vectors; small = straight, ~pi/2 = random.
       confinement_ratio  : net / total displacement (same as directionality;
                            repeated here so the motility block is self-contained).
+      anomalous_exponent : slope alpha of a log-log fit of MSD vs lag (1 = normal
+                           diffusion, <1 subdiffusive, >1 superdiffusive); NaN if
+                           not estimable.
 
     All metrics are defined to degrade gracefully (NaN) for short tracks rather
     than raise, so they are safe to compute for every track.
     """
     out = {"diffusion_coeff": np.nan, "persistence_time": np.nan,
-           "mean_turning_angle": np.nan, "confinement_ratio": np.nan}
+           "mean_turning_angle": np.nan, "confinement_ratio": np.nan,
+           "anomalous_exponent": np.nan}
     n = len(xs)
     if n < 2:
         return out
@@ -493,6 +579,10 @@ def motility_metrics(frames, xs, ys, frame_interval=1.0):
         if np.ptp(lags) > 0:
             slope = np.polyfit(lags, msd, 1)[0]
             out["diffusion_coeff"] = float(slope / 4.0)
+            pos = (lags > 0) & (msd > 0)
+            if pos.sum() >= 2:
+                out["anomalous_exponent"] = float(
+                    np.polyfit(np.log(lags[pos]), np.log(msd[pos]), 1)[0])
 
     # Persistence time from velocity autocorrelation decay.
     if n >= 4 and frame_interval > 0:
@@ -696,7 +786,9 @@ def auto_flag_border_exits(df, mask=None, tail=5, min_tail=3,
 # Nuclear morphometry (NII and its components, after Filippi-Chiela et al. 2012)
 # ---------------------------------------------------------------------------
 NMA_COLS = ["aspect", "area_box", "radius_ratio", "roundness", "nii"]
-MORPHOMETRY_COLS = ["area_px", "perimeter", "circularity"] + NMA_COLS
+_SHAPE_COLS = ["eccentricity", "solidity", "extent", "orientation",
+               "axis_major_length", "axis_minor_length"]
+MORPHOMETRY_COLS = ["area_px", "perimeter", "circularity"] + NMA_COLS + _SHAPE_COLS
 
 
 def _radius_ratio(region):
@@ -741,9 +833,11 @@ def nuclear_morphometry(mask):
       NII = aspect - area_box + radius_ratio + roundness
 
     Also returns area_px, perimeter and circularity (= 1/roundness) so the table
-    is a superset of morphology_timeseries(). Returns columns:
-    frame, track_id, area_px, perimeter, circularity, aspect, area_box,
-    radius_ratio, roundness, nii.
+    is a superset of morphology_timeseries(), plus the standard regionprops shape
+    descriptors (eccentricity, solidity, extent, orientation, axis_major_length,
+    axis_minor_length). Returns columns: frame, track_id, area_px, perimeter,
+    circularity, aspect, area_box, radius_ratio, roundness, nii, eccentricity,
+    solidity, extent, orientation, axis_major_length, axis_minor_length.
     """
     from skimage.measure import regionprops
     cols = ["frame", "track_id"] + MORPHOMETRY_COLS
@@ -775,7 +869,13 @@ def nuclear_morphometry(mask):
                 "area_px": area, "perimeter": perim, "circularity": float(circ),
                 "aspect": float(aspect), "area_box": float(area_box),
                 "radius_ratio": float(rr), "roundness": float(roundness),
-                "nii": float(nii)})
+                "nii": float(nii),
+                "eccentricity": float(r.eccentricity),
+                "solidity": float(r.solidity),
+                "extent": float(r.extent),
+                "orientation": float(r.orientation),
+                "axis_major_length": float(r.axis_major_length),
+                "axis_minor_length": float(r.axis_minor_length)})
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -812,19 +912,6 @@ def morphology_timeseries(mask):
                          "area_px": float(areas[i]), "perimeter": float(perims[i]),
                          "circularity": float(circ[i])})
     return pd.DataFrame(rows, columns=cols)
-
-
-def filter_border(df, exclude_border: bool):
-    """Return df with border-contact rows removed when exclude_border is True.
-
-    Safe no-op when the flag is False or the COL_BORDER column is absent. This
-    is the single gate every statistics function passes through, so the
-    exclude/keep choice is applied consistently everywhere.
-    """
-    from .config import COL_BORDER
-    if not exclude_border or df is None or df.empty or COL_BORDER not in df.columns:
-        return df
-    return df[~df[COL_BORDER].astype(bool)].copy()
 
 
 def exclude_border_rows(df):

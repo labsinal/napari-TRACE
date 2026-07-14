@@ -131,12 +131,22 @@ def lineage_tree_figure(df, max_families=60, max_nodes=400,
         s = 1200 if len(drawn) <= 60 else (500 if len(drawn) <= 200 else 150)
         ax.scatter(xs, ys, s=s, c="#ADD8E6", edgecolors="#2C3E50",
                    linewidth=2.0, zorder=2)
-        # Labels: only when there are few enough to read.
+        # Labels: the genealogy path (1 -> 1.1, 1.2 -> 1.1.1 ...) derived from
+        # parent_id, NOT the raw track_id. This is purely a display translation;
+        # IDs and the mask are never rewritten. The real track_id is shown small
+        # underneath (when the tree is small enough to read) so cells can still be
+        # located in the curator.
+        hlabels = lineage.hierarchical_labels(df)
         if len(drawn) <= 200:
             fs = 12 if len(drawn) <= 60 else 8
+            show_ids = len(drawn) <= 60
             for n in drawn:
-                ax.text(pos_x[n], pos_y[n], str(n), ha="center", va="center",
-                        fontsize=fs, fontweight="bold", color="#1A252F", zorder=3)
+                ax.text(pos_x[n], pos_y[n], hlabels.get(n, str(n)),
+                        ha="center", va="center", fontsize=fs,
+                        fontweight="bold", color="#1A252F", zorder=3)
+                if show_ids:
+                    ax.text(pos_x[n], pos_y[n] - 0.28, f"id {n}", ha="center",
+                            va="center", fontsize=6, color="#5D6D7E", zorder=3)
 
     # Set limits explicitly (LineCollection/scatter don't autoscale reliably).
     if drawn:
