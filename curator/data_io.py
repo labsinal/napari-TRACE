@@ -78,6 +78,29 @@ def add_channel_to_meta(work_dir, name, filename, color="green", measure=False):
     return chans
 
 
+def set_channel_measure(work_dir, name, measure, color=None):
+    """Update the measure flag (and optionally color) of a recorded channel.
+
+    Matches the meta entry by name; a no-op (returns False) when the channel is
+    not recorded (e.g. an auto-discovered channel, whose tags are re-asked at
+    load anyway). So toggling "measure" off in the UI sticks across sessions for
+    channels added through the "Add channel" button.
+    """
+    meta = read_meta(work_dir)
+    chans = meta.get("channels", [])
+    changed = False
+    for c in chans:
+        if c.get("name") == str(name):
+            c["measure"] = bool(measure)
+            if color:
+                c["color"] = str(color)
+            changed = True
+    if changed:
+        meta["channels"] = chans
+        write_meta(work_dir, meta)
+    return changed
+
+
 def setup_working_directory(source_folder):
     """Create a _curated sibling folder on first run; reuse it afterwards."""
     curated_name = os.path.basename(source_folder.rstrip("/\\")) + "_curated"

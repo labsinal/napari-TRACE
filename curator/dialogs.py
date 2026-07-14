@@ -150,6 +150,7 @@ class ChannelConfigDialog(QDialog):
             if L.colormap in CHANNEL_COLORS:
                 color.setCurrentText(L.colormap)
             measure = QCheckBox()
+            measure.setChecked(bool(getattr(L, "measure", False)))
             grid.addWidget(name, i, 0)
             grid.addWidget(color, i, 1)
             grid.addWidget(measure, i, 2)

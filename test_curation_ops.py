@@ -161,6 +161,22 @@ def test_hierarchical_labels_from_parent_id():
     assert labels[30] == "2" and labels[31] == "2.1"   # later root -> family 2
 
 
+def test_set_channel_measure_toggles_in_meta():
+    import tempfile, shutil
+    from curator import data_io
+    wd = tempfile.mkdtemp()
+    try:
+        data_io.write_meta(wd, {"source_folder": "/src", "version": 6})
+        data_io.add_channel_to_meta(wd, "ERK-KTR", "erk.tif", color="green", measure=True)
+        assert data_io.set_channel_measure(wd, "ERK-KTR", False) is True
+        chans = data_io.meta_channels(wd)
+        assert chans[0]["measure"] is False
+        # unknown channel -> no-op
+        assert data_io.set_channel_measure(wd, "nope", True) is False
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

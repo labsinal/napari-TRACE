@@ -1250,6 +1250,34 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                   f"folder (reloads automatically next session).")
     btn_add_channel.clicked.connect(_add_channel)
 
+    btn_config_channels = PushButton(text="Configure channels (color / measure)...")
+
+    def _config_channels():
+        """Re-open the channel dialog to toggle 'measure' (and color) live."""
+        if not channel_layers:
+            return show_info("No extra fluorescence channels loaded.")
+        from .dialogs import ChannelConfigDialog, apply_channel_config
+        from . import data_io as _dio
+        old_names = [L.name for L in channel_layers]
+        dlg = ChannelConfigDialog(channel_layers)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        apply_channel_config(channel_layers, dlg.get_config())
+        for old_name, L in zip(old_names, channel_layers):
+            for ly in viewer.layers:
+                if ly.name == old_name and ly.__class__.__name__ == "Image":
+                    ly.name = L.name
+                    try:
+                        ly.colormap = L.colormap
+                    except Exception:
+                        pass
+            _dio.set_channel_measure(work_dir, L.name, L.measure, color=L.colormap)
+        _refresh_layer_combos()
+        marked = [L.name for L in channel_layers if L.measure]
+        show_info("Channel settings updated. Measured on next SAVE ALL: "
+                  + (", ".join(marked) if marked else "none") + ".")
+    btn_config_channels.clicked.connect(_config_channels)
+
     def _ring_preview():
         # Preview the ring geometry over the cytoplasm channel (fallback: nucleus).
         name = cyto_channel.value or nuc_channel.value
@@ -1808,7 +1836,8 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                  [custom_source, custom_x, custom_y, custom_group, custom_kind,
                   custom_agg, custom_legend, btn_custom], collapsed=True),
         _section("FLUORESCENCE",
-                 [btn_add_channel, cyto_channel, nuc_channel, bg_roi_layer,
+                 [btn_add_channel, btn_config_channels,
+                  cyto_channel, nuc_channel, bg_roi_layer,
                   ring_dilation, ring_gap, btn_ring_preview,
                   btn_erk, btn_53bp1], collapsed=True),
     ]

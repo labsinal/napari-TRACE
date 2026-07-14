@@ -846,6 +846,12 @@ bleed one cell's signal into another's ring.
   image), tag its color and "measure" flag, and it is added as a layer and
   **copied into the `_curated` working folder**, so it reloads automatically in
   later sessions (recorded in `curator_meta.json`).
+- **Configure channels (color / measure)…** — re-open the tag dialog for the
+  channels already loaded to change a color or toggle the "measure" flag on/off
+  at any time (e.g. to stop a channel from dumping its full per-compartment set
+  into `<base>_features.csv`). The change takes effect on the next **SAVE ALL**
+  and is remembered across sessions for button-added channels. The interactive
+  ERK-KTR / 53BP1 buttons work regardless of this flag.
 - **Cytoplasm channel (ERK-KTR)** and **Nucleus channel (53BP1)** — two separate
   pickers so both roles are selected at once. The ERK-KTR button and the ring
   preview use the cytoplasm channel; the 53BP1 button uses the nucleus channel.
