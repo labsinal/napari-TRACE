@@ -125,9 +125,13 @@ def features_table(df, mask, pixel_size=1.0, frame_interval=1.0,
     ropts = ring_opts or {}
     dil = int(ropts.get("dilation", fluorescence.RING_DILATION_DEFAULT))
     gap = int(ropts.get("gap", fluorescence.RING_GAP_DEFAULT))
+    bg_mode = ropts.get("background_mode", "non_cell_median")
+    use_ellipse = bool(ropts.get("use_ellipse", False))
     for name, stack in (channels or {}).items():
         inten = fluorescence.measure_intensity(stack, mask, channel_name=name,
-                                               dilation=dil, gap=gap)
+                                               dilation=dil, gap=gap,
+                                               background_mode=bg_mode,
+                                               use_ellipse=use_ellipse)
         if not inten.empty:
             inten = inten.rename(columns={"track_id": COL_TRACK, "frame": COL_FRAME})
             out = out.merge(inten, on=[COL_TRACK, COL_FRAME], how="left")

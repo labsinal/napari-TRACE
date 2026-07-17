@@ -858,50 +858,72 @@ bleed one cell's signal into another's ring.
 - **Cytoplasm ring width (px)** (`dilation`) and **ring gap from nucleus (px)**
   (`gap`) — the ring starts `gap` px outside the nuclear boundary and is
   `dilation` px wide. Defaults are 2 px dilation, 1 px gap.
-- **Background ROI (cell-free)** — a picker listing any Labels or Shapes layer.
-  Leave it on `(auto: non-cell median)` to subtract the default per-frame
-  background, or draw a Labels/Shapes layer over a genuinely empty region and
-  select it to measure the background there instead (more accurate in confluent
-  fields, where "outside every nucleus" still contains cytoplasm). The
-  channel/ROI pickers refresh automatically as you add or remove layers.
+- **Background ROI (cell-free)** — a picker with two automatic strategies plus
+  any Labels or Shapes layer:
+  - `(auto: non-cell median)` (default) — median intensity of pixels outside
+    every cell in that frame. Robust to a single bad pixel, but on a
+    nucleus-only mask "outside every nucleus" still contains cytoplasm, so it
+    can read a bit high in a confluent field.
+  - `(auto: image min)` — the frame's single darkest pixel. Unaffected by
+    confluence (it doesn't care how much of the frame is cytoplasm), but
+    fragile to one hot/dead/noise pixel skewing the estimate.
+  - any drawn Labels/Shapes layer over a genuinely empty region — the median
+    inside it is used instead of either automatic strategy, and always wins
+    when selected.
+  Neither automatic strategy is strictly better; pick whichever matches the
+  dataset's failure mode. The channel/ROI pickers refresh automatically as you
+  add or remove layers.
+- **Ring geometry: ellipse-fit (vs. contour dilation)** — a checkbox switching
+  how the cytoplasm ring is built. Off (default) dilates the nucleus's real,
+  possibly irregular contour. On, an ellipse is fitted to the nucleus
+  (centroid, orientation and axis lengths) and the ring is built from the
+  ellipse's boundary instead — more stable for concave or oddly-shaped nuclei,
+  at the cost of ignoring the nucleus's real shape when sampling the
+  surrounding cytoplasm. Either way the nucleus itself is always measured on
+  its real segmentation; only the ring's geometry changes. Applies to the ring
+  preview and both buttons below (harmless, with no effect, for 53BP1, which
+  never reads the ring).
 - **Preview ring on a random nucleus** — opens a small-multiples figure showing
   the ring growing (dilation = 1, 2, 3, ...) on one real nucleus from the
-  movie, overlaid on the channel and with neighboring nuclei shaded, so you can
-  sanity-check the parameters against the actual cell density before running a
-  full measurement.
+  movie, in the currently selected geometry, overlaid on the channel and with
+  neighboring nuclei shaded, so you can sanity-check the parameters against the
+  actual cell density before running a full measurement.
 - **Compute ERK-KTR C/N (cytoplasm channel → features)** — for the selected
-  **Cytoplasm channel**, computes the ring/nucleus (cytoplasm/nucleus) median
-  intensity ratio per (track, frame), plots it per track, adds it to the export
-  as `<channel>_cn_ratio`, and writes `<base>_erk_ktr.csv`. A high C/N indicates
-  active ERK signalling driving the KTR reporter out of the nucleus, per the
-  ERK-KTR ring/annulus convention (Regot et al. 2014; Kudo et al. 2018).
+  **Cytoplasm channel**, computes the ring/nucleus (cytoplasm/nucleus) intensity
+  ratio per (track, frame) — both median- and mean-based, and both directions
+  (C/N and N/C) — plots the median-based C/N per track, adds all four ratio
+  columns to the export, and writes `<base>_erk_ktr.csv`. A high C/N (low N/C)
+  indicates active ERK signalling driving the KTR reporter out of the nucleus,
+  per the ERK-KTR ring/annulus convention (Regot et al. 2014; Kudo et al. 2018).
 - **Measure 53BP1 nuclear texture (nucleus channel → features)** — for the
   selected **Nucleus channel**, computes nuclear median intensity, its standard
-  deviation and
-  coefficient of variation, plus the Haralick texture set, as a proxy for
-  DNA-damage (53BP1) foci graininess: a more textured (grainier) nucleus
-  indicates more/brighter foci than a uniformly diffuse one. Writes
+  deviation and coefficient of variation, plus the Haralick texture set, as a
+  proxy for DNA-damage (53BP1) foci graininess: a more textured (grainier)
+  nucleus indicates more/brighter foci than a uniformly diffuse one. Writes
   `<base>_53bp1.csv`.
 
 Both buttons accumulate their result in memory and merge it into
 `<base>_features.csv` on the next **SAVE ALL**; they do not write to the main
 tracking table.
 
-Every per-compartment intensity statistic and the C/N ratio is
+Every per-compartment intensity statistic and every ratio is
 **background-subtracted** first: a per-frame background is subtracted and
-clipped at zero. By default the background is the median intensity of pixels
-outside every cell in that frame; if a **Background ROI** layer is selected, the
-median inside that cell-free region is used instead. Haralick texture is
-computed on the raw (not background-subtracted) nuclear intensity, scaled by its
-own 1st/99th-percentile range.
+clipped at zero, using whichever strategy the **Background ROI** picker selects
+(see above). Haralick texture is computed on the raw (not background-subtracted)
+nuclear intensity, scaled by its own 1st/99th-percentile range.
 
 The columns produced for every marked channel, in `<base>_features.csv` /
 `<base>_fluorescence.csv`, are:
 
 - `<channel>_<compartment>_<stat>` for `compartment` in `nuc`/`ring`/`cell` and
   `stat` in `mean`/`median`/`sum`/`min`/`max`/`std`/`p90`.
-- `<channel>_cn_ratio` — ring-median ÷ nucleus-median (the cytoplasm/nucleus
-  ratio used by KTR reporters).
+- `<channel>_cn_ratio` / `<channel>_cn_ratio_mean` — ring ÷ nucleus (the
+  cytoplasm/nucleus ratio used by KTR reporters), median- and mean-based.
+- `<channel>_nc_ratio` / `<channel>_nc_ratio_mean` — the reciprocal direction
+  (nucleus ÷ ring). Each of the four ratio columns is computed directly (not as
+  one another's reciprocal) with its own zero-guard, so a ring or nucleus
+  reading of exactly 0 after background subtraction only blanks the ratio that
+  actually divides by it.
 - `<channel>_hara_contrast` / `_correlation` / `_energy` / `_homogeneity` /
   `_entropy` — Haralick texture (gray-level co-occurrence matrix, 16 gray
   levels, averaged over 4 angles) computed on the nuclear ROI.

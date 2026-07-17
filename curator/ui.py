@@ -118,23 +118,32 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                 return np.asarray(ly.data)
         return None
 
-    # Background-ROI layer choices: "(auto)" plus any Labels/Shapes layer the user
-    # draws to mark a genuinely cell-free region (Labels or Shapes).
-    _ROI_AUTO = "(auto: non-cell median)"
+    # Background-ROI layer choices: two "(auto)" strategies plus any Labels/Shapes
+    # layer the user draws to mark a genuinely cell-free region.
+    _ROI_AUTO_MEDIAN = "(auto: non-cell median)"
+    _ROI_AUTO_IMGMIN = "(auto: image min)"
 
     def _roi_layer_choices(widget=None):
         names = [ly.name for ly in viewer.layers
                  if ly.__class__.__name__ in ("Labels", "Shapes")
                  and ly.name != LAYER_MASK]
-        return [_ROI_AUTO] + names
+        return [_ROI_AUTO_MEDIAN, _ROI_AUTO_IMGMIN] + names
+
+    def _background_mode_from_choice(name):
+        """"image_min" or "non_cell_median" per the picker's auto choice.
+
+        Only meaningful when no actual ROI layer is selected (an explicit ROI
+        always wins in fluorescence.measure_intensity regardless of this mode).
+        """
+        return "image_min" if name == _ROI_AUTO_IMGMIN else "non_cell_median"
 
     def _roi_from_layer(name):
         """Boolean cell-free ROI (H x W or T x H x W) from a Labels/Shapes layer.
 
-        Returns None for the "(auto)" choice so measure_intensity falls back to
-        the non-cell-median background.
+        Returns None for either "(auto)" choice so measure_intensity falls back
+        to the automatic background (see _background_mode_from_choice).
         """
-        if not name or name == _ROI_AUTO:
+        if not name or name in (_ROI_AUTO_MEDIAN, _ROI_AUTO_IMGMIN):
             return None
         h, w = state.mask.shape[-2:]
         for ly in viewer.layers:
@@ -1142,7 +1151,9 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                 frame_interval=frame_interval_input.value,
                 channels=marked or None,
                 ring_opts={"dilation": int(ring_dilation.value),
-                           "gap": int(ring_gap.value)},
+                           "gap": int(ring_gap.value),
+                           "background_mode": _background_mode_from_choice(bg_roi_layer.value),
+                           "use_ellipse": bool(use_ellipse_cb.value)},
                 extra_tables=list(extra_feature_tables) or None)
             audit.record("export_tables",
                          detail=f"{len(res['files'])} tables, "
@@ -1167,6 +1178,8 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     # --- Fluorescence: ring params, preview, ERK-KTR, 53BP1 ---
     ring_dilation = SpinBox(label="Cytoplasm ring width (px):", value=2, min=1, max=20)
     ring_gap = SpinBox(label="Ring gap from nucleus (px):", value=1, min=0, max=10)
+    use_ellipse_cb = CheckBox(
+        label="Ring geometry: ellipse-fit (vs. contour dilation)", value=False)
     # Two explicit channel roles so both can be set at once: the cytoplasm/reporter
     # channel drives ERK-KTR C/N and the ring preview; the nucleus channel drives
     # the 53BP1 nuclear-texture measure. Each button uses the right one.
@@ -1286,7 +1299,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
             fig = fluorescence.ring_preview_figure(
                 state.mask, stack, track_id=None,
                 dilations=tuple(range(1, int(ring_dilation.value) + 1)) or (1,),
-                gap=int(ring_gap.value))
+                gap=int(ring_gap.value), use_ellipse=use_ellipse_cb.value)
             stats.show(fig)
         except Exception as exc:
             show_error(f"Ring preview failed: {exc}")
@@ -1303,11 +1316,15 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         df = fluorescence.measure_intensity(
             stack, state.mask, channel_name=name,
             dilation=int(ring_dilation.value), gap=int(ring_gap.value),
-            background_roi=_roi_from_layer(bg_roi_layer.value))
+            background_roi=_roi_from_layer(bg_roi_layer.value),
+            background_mode=_background_mode_from_choice(bg_roi_layer.value),
+            use_ellipse=use_ellipse_cb.value)
         if df.empty:
             return show_error("No cells measured.")
         col = f"{name}_cn_ratio"
-        keep = df[["track_id", "frame", col]]
+        ratio_cols = [f"{name}_cn_ratio", f"{name}_cn_ratio_mean",
+                     f"{name}_nc_ratio", f"{name}_nc_ratio_mean"]
+        keep = df[["track_id", "frame"] + ratio_cols]
         extra_feature_tables.append(keep)
         import os
         out_dir, base = _exports_dir_and_base()
@@ -1330,7 +1347,9 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         inten = fluorescence.measure_intensity(
             stack, state.mask, channel_name=name,
             dilation=int(ring_dilation.value), gap=int(ring_gap.value),
-            background_roi=_roi_from_layer(bg_roi_layer.value))
+            background_roi=_roi_from_layer(bg_roi_layer.value),
+            background_mode=_background_mode_from_choice(bg_roi_layer.value),
+            use_ellipse=use_ellipse_cb.value)
         hara = fluorescence.haralick_features(stack, state.mask, channel_name=name)
         cols = ["track_id", "frame", f"{name}_nuc_median", f"{name}_nuc_std"]
         merged = inten[cols].merge(hara, on=["track_id", "frame"], how="left")
@@ -1838,7 +1857,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         _section("FLUORESCENCE",
                  [btn_add_channel, btn_config_channels,
                   cyto_channel, nuc_channel, bg_roi_layer,
-                  ring_dilation, ring_gap, btn_ring_preview,
+                  ring_dilation, ring_gap, use_ellipse_cb, btn_ring_preview,
                   btn_erk, btn_53bp1], collapsed=True),
     ]
     stats_host = QWidget()

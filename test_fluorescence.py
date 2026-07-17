@@ -262,6 +262,87 @@ def test_features_table_includes_deep_lineage_id():
     assert out.loc[out[COL_TRACK] == 1122111, "area_px"].notna().all()
 
 
+
+# --- Background mode: image min (vs. non-cell median) ----------------------
+def test_background_image_min_is_frame_min():
+    ch = np.array([[5.0, 5.0, 100.0], [5.0, 2.0, 100.0], [5.0, 5.0, 100.0]])
+    assert fl.background_image_min(ch) == 2.0
+
+
+def test_measure_intensity_background_mode_image_min():
+    p = _two_nuclei_plane()
+    mask = p[None, ...]
+    ch = np.full((1, 20, 20), 10.0)      # non-cell background is uniform 10
+    ch[0, 0, 0] = 1.0                    # one dark corner pixel -> image min = 1.0
+    ch[0][p == 1] = 21.0                 # nucleus 1 raw intensity
+    df_default = fl.measure_intensity(ch, mask, channel_name="g")
+    df_imgmin = fl.measure_intensity(ch, mask, channel_name="g",
+                                     background_mode="image_min")
+    row_def = df_default[df_default["track_id"] == 1].iloc[0]
+    row_min = df_imgmin[df_imgmin["track_id"] == 1].iloc[0]
+    # default: bg = non-cell MEDIAN (~10, robust to the single dark pixel)
+    assert abs(row_def["g_nuc_median"] - 11.0) < 1e-6      # 21 - 10
+    # image_min: bg = the single darkest pixel in the frame (1.0)
+    assert abs(row_min["g_nuc_median"] - 20.0) < 1e-6      # 21 - 1
+
+
+# --- Ellipse-fit ring geometry (alternative to contour dilation) ------------
+def test_compartment_masks_ellipse_ring_and_neighbor_exclusion():
+    mask = np.zeros((30, 40), dtype=np.int32)
+    mask[10:14, 5:25] = 1     # a 4x20 elongated "rod" nucleus (strongly non-circular)
+    mask[10:14, 30:34] = 2    # neighbor nucleus
+    m = fl.compartment_masks_ellipse(mask, 1, dilation=2, gap=1)
+    assert m["nuc"].sum() == (mask == 1).sum()        # nucleus stays the real mask
+    assert m["ring"].sum() > 0
+    assert not (m["ring"] & (mask == 1)).any()        # never covers its own nucleus
+    assert not (m["ring"] & (mask == 2)).any()        # never covers neighbor nucleus
+    assert (m["cell"] == (m["nuc"] | m["ring"])).all()
+
+
+def test_ellipse_ring_differs_from_contour_ring_for_elongated_nucleus():
+    mask = np.zeros((30, 40), dtype=np.int32)
+    mask[10:14, 5:25] = 1
+    m_contour = fl.compartment_masks(mask, 1, dilation=2, gap=1)
+    m_ellipse = fl.compartment_masks_ellipse(mask, 1, dilation=2, gap=1)
+    assert not np.array_equal(m_contour["ring"], m_ellipse["ring"])
+
+
+def test_measure_intensity_use_ellipse_flag_changes_ring_stats():
+    H, W = 30, 40
+    mask = np.zeros((1, H, W), dtype=np.int32)
+    mask[0, 10:14, 5:25] = 1
+    grad = np.linspace(0, 100, H * W).reshape(H, W)
+    ch = grad[None, :, :].copy()
+    df_contour = fl.measure_intensity(ch, mask, channel_name="g",
+                                      use_ellipse=False, subtract_background=False)
+    df_ellipse = fl.measure_intensity(ch, mask, channel_name="g",
+                                      use_ellipse=True, subtract_background=False)
+    assert df_contour["g_ring_sum"].iloc[0] != df_ellipse["g_ring_sum"].iloc[0]
+
+
+# --- cn_ratio_mean + N/C ratios (independent of C/N, own zero-guards) -------
+def test_cn_and_nc_ratios_mean_and_median_are_independent():
+    # nucleus 1: 30 px @10 + 6 px @100 (36 px total) -> median=10, mean=25
+    mask = np.zeros((1, 20, 20), dtype=np.int32)
+    mask[0, 2:8, 2:8] = 1          # 6x6 = 36 px nucleus
+    ch = np.zeros((1, 20, 20), dtype=float)
+    nuc_region = np.zeros((6, 6))
+    nuc_region[:5, :] = 10.0       # 30 px @10
+    nuc_region[5, :] = 100.0       # 6 px @100
+    ch[0, 2:8, 2:8] = nuc_region
+    m = fl.compartment_masks(mask[0], 1, dilation=2, gap=1)
+    ch[0][m["ring"]] = 50.0        # uniform ring: median == mean == 50
+    df = fl.measure_intensity(ch, mask, channel_name="g", subtract_background=False)
+    row = df[df["track_id"] == 1].iloc[0]
+    assert row["g_nuc_median"] == 10.0
+    assert abs(row["g_nuc_mean"] - 25.0) < 1e-9
+    assert row["g_ring_median"] == 50.0 and row["g_ring_mean"] == 50.0
+    assert abs(row["g_cn_ratio"] - 5.0) < 1e-9         # 50 / 10 (median)
+    assert abs(row["g_cn_ratio_mean"] - 2.0) < 1e-9    # 50 / 25 (mean)
+    assert abs(row["g_nc_ratio"] - 0.2) < 1e-9         # 10 / 50 (median)
+    assert abs(row["g_nc_ratio_mean"] - 0.5) < 1e-9    # 25 / 50 (mean)
+
+
 if __name__ == "__main__":
     import matplotlib
     matplotlib.use("Agg")
