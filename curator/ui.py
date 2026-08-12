@@ -370,7 +370,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
             has_flag = ~np.isin(oc, ["", "nan", "None"])
             texts = np.where(
                 has_flag,
-                np.char.add(np.char.add(tid_arr.astype(str), " - "), oc),
+                np.char.add(np.char.add(tid_arr.astype(str), " - "), oc.astype(str)),
                 tid_arr.astype(str)).tolist()
             viewer.add_points(pts, name=LAYER_IDS,
                               properties={"label": texts},

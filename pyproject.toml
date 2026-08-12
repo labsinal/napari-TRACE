@@ -12,12 +12,18 @@ license = { text = "BSD-3-Clause" }
 authors = [{ name = "Nickolas Pippi Peranzoni" }]
 keywords = ["napari", "cell tracking", "curation", "microscopy", "lineage"]
 dependencies = [
-  # Qt/napari stack: pinned so the environment stays reproducible.
-  "napari[all]>=0.4.19,<0.6",
+  # napari 0.5.x is numpy-1 compatible (tested with 0.5.6 + numpy 1.26); the <0.6
+  # cap keeps out a future napari that would force numpy>=2 and clash with a
+  # co-installed forNMA (which pins numpy<2 on Python <3.12 for cellpose).
+  "napari[all]>=0.5,<0.6",
   "magicgui>=0.7,<0.11",
   "qtpy>=2.3",
   "imageio[ffmpeg]>=2.25",
-  # Scientific deps: lower bounds only, so co-install with forNMA's exact pins resolves.
+  # Scientific deps: lower bounds only. numpy is intentionally NOT upper-capped
+  # here so the plugin still works standalone on numpy 2 / Python 3.12+; when
+  # co-installed, forNMA's own numpy pin drives the resolved version. Always
+  # install the whole set in ONE pip pass (e.g. via requirements-local-ui.txt),
+  # never plugin-after-app, or a lone `pip install napari-TRACE` can bump numpy.
   "numpy>=1.24",
   "pandas>=2.0",
   "scikit-image>=0.20",
