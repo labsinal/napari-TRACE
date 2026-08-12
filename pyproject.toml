@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-TRACE"
+version = "0.6.0"
+description = "Tracking Review and Correction Engine - napari plugin for curating cell-tracking results"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "Nickolas Pippi Peranzoni" }]
+keywords = ["napari", "cell tracking", "curation", "microscopy", "lineage"]
+dependencies = [
+  # Qt/napari stack: pinned so the environment stays reproducible.
+  "napari[all]>=0.4.19,<0.6",
+  "magicgui>=0.7,<0.11",
+  "qtpy>=2.3",
+  "imageio[ffmpeg]>=2.25",
+  # Scientific deps: lower bounds only, so co-install with forNMA's exact pins resolves.
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "scikit-image>=0.20",
+  "scipy>=1.10",
+  "tifffile>=2023.1.1",
+  "matplotlib>=3.5",
+]
+
+# Lets forNMA (or anyone) launch the curator from the installed environment
+# without knowing the source folder: `napari-trace` or `python -m curator.app`.
+[project.scripts]
+napari-trace = "curator.app:main"
+
+[tool.setuptools.packages.find]
+include = ["curator*"]
