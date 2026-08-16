@@ -1643,14 +1643,14 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         hara = fluorescence.haralick_features(
             stack, state.mask, channel_name=name,
             background_mode=_background_mode_from_choice(bg_roi_layer.value))
-        bleach = fluorescence.bleach_factor(stack, state.mask)
+        drift = fluorescence.signal_drift(stack, state.mask)
         cols = ["track_id", "frame", f"{name}_nuc_median", f"{name}_nuc_std"]
         merged = inten[cols].merge(hara, on=["track_id", "frame"], how="left")
         merged[f"{name}_nuc_cv"] = (
             merged[f"{name}_nuc_std"] /
             merged[f"{name}_nuc_median"].replace(0, np.nan))
-        merged = merged.merge(bleach.rename(
-            columns={"bleach_factor": f"{name}_bleach_factor"}),
+        merged = merged.merge(drift.rename(
+            columns={"signal_drift": f"{name}_signal_drift"}),
             on="frame", how="left")
         extra_feature_tables.append(merged)
         import os

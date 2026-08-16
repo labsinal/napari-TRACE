@@ -398,21 +398,33 @@ def _glcm_row(crop_q, nuc_crop, levels):
     return out
 
 
-def bleach_factor(channel_stack, mask):
-    """Per-frame in-mask median normalised to the first frame's.
+def signal_drift(channel_stack, mask):
+    """Per-frame in-mask median relative to the first frame's.
 
-    Photobleaching moves the whole intensity distribution down over a long
-    timelapse. Any absolute-intensity or texture feature therefore drifts with
-    frame number for a purely optical reason. This exposes that drift as a
-    column so it can be regressed out (or simply checked) downstream, instead of
-    being silently baked into the features. Correcting it is an analysis
-    decision, not an extraction one, so nothing here divides by it.
+    Exposes how the whole in-cell intensity distribution moves over a long
+    timelapse, so an absolute-intensity or texture trend can be checked against
+    it instead of being read straight as biology.
 
-    Returns a DataFrame with columns frame, bleach_factor (1.0 at the first
-    frame that has any cell, NaN for empty frames).
+    DO NOT DIVIDE BY THIS. The quantity mixes two causes it cannot separate:
+    photobleaching (optical, pushes it down) and any real change in the marker
+    (biological, pushes it either way). For a CONSTITUTIVE marker it is
+    essentially the bleaching curve. For an INDUCIBLE one -- 53BP1, gammaH2AX,
+    a stress reporter -- it rises with the very response being measured, so
+    dividing by it removes the signal. Measured on a real dataset: the in-mask
+    median rose from 0.60 to 0.83 across a treatment window and correlated with
+    the 53BP1 level at rho = +0.58, and "correcting" a highly significant damage
+    response (p = 0.004) by it drove the same test to p = 1.0.
+
+    Separating the two needs a reference that does not respond to the treatment
+    (a constitutive channel, or an untreated well imaged alongside). Absent
+    that, prefer texture features, which describe the SHAPE of the in-nucleus
+    distribution and are far less sensitive to a global scaling than the median.
+
+    Returns a DataFrame with columns frame, signal_drift (1.0 at the first frame
+    that has any cell, NaN for empty frames).
     """
     if channel_stack is None or mask is None:
-        return pd.DataFrame(columns=["frame", "bleach_factor"])
+        return pd.DataFrame(columns=["frame", "signal_drift"])
     meds = []
     for f in range(mask.shape[0]):
         inside = channel_stack[f][mask[f] > 0]
@@ -423,7 +435,7 @@ def bleach_factor(channel_stack, mask):
     with np.errstate(divide="ignore", invalid="ignore"):
         factor = meds / ref if (ref and np.isfinite(ref)) else np.full_like(meds, np.nan)
     return pd.DataFrame({"frame": np.arange(mask.shape[0]),
-                         "bleach_factor": factor})
+                         "signal_drift": factor})
 
 
 def haralick_features(channel_stack, mask, channel_name="ch", levels=16,
@@ -437,7 +449,7 @@ def haralick_features(channel_stack, mask, channel_name="ch", levels=16,
     intensity baseline, which is why the background is subtracted per frame
     first: an uncorrected baseline shift walks pixels between quantisation bins
     and shows up as a texture trend that is really an illumination trend. See
-    :func:`bleach_factor` for the part this cannot fix.
+    :func:`signal_drift` for the part this cannot fix.
     """
     cols = ["frame", "track_id"] + [f"{channel_name}_hara_{c}" for c in _HARA_COLS]
     if channel_stack is None or mask is None:

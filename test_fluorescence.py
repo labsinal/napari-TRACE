@@ -428,14 +428,14 @@ def test_ring_sweep_reports_growing_ring():
     assert sweep["ring_px_median"].is_monotonic_increasing
 
 
-def test_bleach_factor_tracks_signal_decay():
+def test_signal_drift_tracks_the_in_mask_median():
     mask = np.zeros((3, 10, 10), dtype=np.int32)
     mask[:, 3:7, 3:7] = 1
     ch = np.zeros((3, 10, 10), dtype=float)
     for f, level in enumerate((100.0, 50.0, 25.0)):
         ch[f][mask[f] == 1] = level
-    bf = fl.bleach_factor(ch, mask)
-    assert list(bf["bleach_factor"]) == [1.0, 0.5, 0.25]
+    bf = fl.signal_drift(ch, mask)
+    assert list(bf["signal_drift"]) == [1.0, 0.5, 0.25]
 
 
 if __name__ == "__main__":
