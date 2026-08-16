@@ -11,6 +11,8 @@ and presentation only. It is imported only inside the napari environment.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -28,7 +30,7 @@ import napari
 from magicgui.widgets import Container, PushButton, SpinBox, FloatSpinBox, Label, ComboBox, CheckBox
 from napari.utils.notifications import show_info, show_error
 from qtpy.QtWidgets import (QFileDialog, QMessageBox, QScrollArea, QDialog,
-                            QWidget, QVBoxLayout, QGroupBox)
+                            QWidget, QVBoxLayout, QGroupBox, QInputDialog)
 
 from . import config
 from .config import (
@@ -80,6 +82,15 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     # Normalize to a mutable list so the in-app "Add channel" button can append
     # to it and on_save / the measure export see the newly added channels.
     channel_layers = list(channel_layers or [])
+    # The movie the segmentation was run on IS the nucleus channel -- that is
+    # what the nuclear mask was drawn from. It is already on screen (added
+    # above), so it gets a ChannelLayer purely so it can be treated like any
+    # other measurable channel: given a raw measurement source, validated, and
+    # recorded in the provenance. Without this the nuclear marker was the one
+    # channel that could never be pointed at its own raw frames.
+    from .channels import ChannelLayer as _ChannelLayer
+    main_nucleus_layer = _ChannelLayer(name=LAYER_RAW, data=images,
+                                       colormap="gray", role="nucleus")
     channel_layer_names = []
     for ch in channel_layers:
         try:
@@ -108,6 +119,11 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     # per-(track,frame) DataFrame; on the next save they merge into features.
     extra_feature_tables = []
 
+    # Real acquisition time per frame (curator.timeaxis). None until the user
+    # points at the frame folder; every export then uses real hours instead of
+    # assuming the stack index is a uniform clock.
+    time_axis = {"table": None, "source": ""}
+
     def _image_layer_choices(widget=None):
         return [ly.name for ly in viewer.layers
                 if ly.__class__.__name__ == "Image"]
@@ -118,8 +134,52 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                 return np.asarray(ly.data)
         return None
 
-    # Background-ROI layer choices: two "(auto)" strategies plus any Labels/Shapes
-    # layer the user draws to mark a genuinely cell-free region.
+    def _measurable_layers():
+        """Every layer that can be quantified: the nucleus movie + extra channels.
+
+        Built fresh on each call because ``channel_layers`` is appended to at
+        runtime by the "Add channel" button.
+        """
+        return [main_nucleus_layer] + list(channel_layers)
+
+    def _layer_by_name(name):
+        """The ChannelLayer behind a display layer name, if there is one.
+
+        Measurement must read ``ChannelLayer.quant`` (the raw source when one was
+        set), not the display array -- see channels.ChannelLayer. Returns None
+        for anything with no ChannelLayer behind it, and the caller then falls
+        back to the plain display array.
+        """
+        for L in _measurable_layers():
+            if L.name == name:
+                return L
+        return None
+
+    def _quant_stack_by_name(name):
+        """The array to QUANTIFY for a channel name (raw source if one was set)."""
+        L = _layer_by_name(name)
+        if L is not None:
+            return np.asarray(L.quant)
+        return _channel_stack_by_name(name)
+
+    def _measure_note(name):
+        """One line stating what a channel's numbers will actually come from."""
+        L = _layer_by_name(name)
+        if L is None:
+            return f"'{name}': measured from the displayed layer."
+        if L.measurement_is_display:
+            return (f"'{name}': NO raw measurement source set - measuring the "
+                    f"DISPLAYED array. If that layer is contrast-enhanced or "
+                    f"normalised, intensity ratios from it are not quantitative.")
+        return (f"'{name}': measured from {os.path.basename(L.measure_source)} "
+                f"({np.asarray(L.quant).dtype}).")
+
+    # Background-ROI layer choices: three "(auto)" strategies plus any
+    # Labels/Shapes layer the user draws to mark a genuinely cell-free region.
+    # "far from cells" leads because it is the only automatic estimate that does
+    # not count perinuclear cytoplasm as background -- the others drift upward as
+    # the field fills up, which over-subtracts more and more over a timelapse.
+    _ROI_AUTO_FARCELL = "(auto: far from cells)"
     _ROI_AUTO_MEDIAN = "(auto: non-cell median)"
     _ROI_AUTO_IMGMIN = "(auto: image min)"
 
@@ -127,15 +187,19 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         names = [ly.name for ly in viewer.layers
                  if ly.__class__.__name__ in ("Labels", "Shapes")
                  and ly.name != LAYER_MASK]
-        return [_ROI_AUTO_MEDIAN, _ROI_AUTO_IMGMIN] + names
+        return [_ROI_AUTO_FARCELL, _ROI_AUTO_MEDIAN, _ROI_AUTO_IMGMIN] + names
 
     def _background_mode_from_choice(name):
-        """"image_min" or "non_cell_median" per the picker's auto choice.
+        """The automatic background estimator behind the picker's "(auto)" entries.
 
         Only meaningful when no actual ROI layer is selected (an explicit ROI
         always wins in fluorescence.measure_intensity regardless of this mode).
         """
-        return "image_min" if name == _ROI_AUTO_IMGMIN else "non_cell_median"
+        if name == _ROI_AUTO_IMGMIN:
+            return "image_min"
+        if name == _ROI_AUTO_MEDIAN:
+            return "non_cell_median"
+        return "far_from_cells"
 
     def _roi_from_layer(name):
         """Boolean cell-free ROI (H x W or T x H x W) from a Labels/Shapes layer.
@@ -1140,8 +1204,34 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
             triage_review.prune(existing)
             review.prune(lineage.lineage_roots(state.df))
             base = os.path.splitext(os.path.basename(csv_path))[0]
-            marked = {L.name: np.asarray(L.data) for L in (channel_layers or [])
+            # Quantify the raw source when one was set; L.quant falls back to the
+            # display array (and the provenance file records which it was).
+            marked = {L.name: np.asarray(L.quant) for L in _measurable_layers()
                       if getattr(L, "measure", False)}
+            ring_opts = {"dilation": int(ring_dilation.value),
+                         "gap": int(ring_gap.value),
+                         "neighbor_gap": int(neighbor_gap.value),
+                         "background_mode": _background_mode_from_choice(bg_roi_layer.value),
+                         "use_ellipse": bool(use_ellipse_cb.value)}
+            provenance = {
+                "channels": {
+                    L.name: {
+                        "display": getattr(L, "name", ""),
+                        "measured_from": L.measure_source or "(display array)",
+                        "measurement_is_display": bool(L.measurement_is_display),
+                        "dtype": str(np.asarray(L.quant).dtype),
+                        "role": getattr(L, "role", ""),
+                    } for L in _measurable_layers()
+                    if getattr(L, "measure", False) or not L.measurement_is_display
+                },
+                "ring": ring_opts,
+                "pixel_size_um_px": float(pixel_size_input.value),
+                "frame_interval": float(frame_interval_input.value),
+                "time_source": (time_axis["table"].attrs.get("time_source")
+                                if time_axis["table"] is not None
+                                else "assumed_interval"),
+                "time_folder": time_axis["source"],
+            }
             res = exports.write_all(
                 work_dir, state.df, state.mask,
                 reviewed_roots=review.reviewed_roots(),
@@ -1150,11 +1240,9 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                 pixel_size=pixel_size_input.value,
                 frame_interval=frame_interval_input.value,
                 channels=marked or None,
-                ring_opts={"dilation": int(ring_dilation.value),
-                           "gap": int(ring_gap.value),
-                           "background_mode": _background_mode_from_choice(bg_roi_layer.value),
-                           "use_ellipse": bool(use_ellipse_cb.value)},
-                extra_tables=list(extra_feature_tables) or None)
+                ring_opts=ring_opts,
+                extra_tables=list(extra_feature_tables) or None,
+                time_table=time_axis["table"], provenance=provenance)
             audit.record("export_tables",
                          detail=f"{len(res['files'])} tables, "
                                 f"{res['n_validated_tracks']} validated tracks -> {res['dir']}")
@@ -1186,10 +1274,17 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     cyto_channel = ComboBox(label="Cytoplasm channel (ERK-KTR):",
                             choices=_image_layer_choices)
     nuc_channel = ComboBox(label="Nucleus channel (53BP1):",
-                           choices=_image_layer_choices)
+                           choices=_image_layer_choices, value=LAYER_RAW)
     bg_roi_layer = ComboBox(label="Background ROI (cell-free):", choices=_roi_layer_choices)
+    neighbor_gap = SpinBox(label="Keep ring clear of neighbours (px):", value=0,
+                           min=0, max=20)
     btn_add_channel = PushButton(text="Add fluorescence channel...")
+    btn_measure_source = PushButton(text="Set RAW measurement source for a channel...")
     btn_ring_preview = PushButton(text="Preview ring on a random nucleus")
+    btn_ring_sweep = PushButton(text="Sweep ring width (pick by plateau)")
+    btn_time_axis = PushButton(text="Set time axis from frame folder...")
+    lbl_measure_src = Label(value="Measurement source: (display array)")
+    lbl_time_axis = Label(value="Time axis: assuming a uniform frame interval")
 
     # Keep the channel/ROI dropdowns in sync as the user adds/removes layers
     # (e.g. draws a Shapes layer for the background ROI, or adds a channel).
@@ -1263,6 +1358,196 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                   f"folder (reloads automatically next session).")
     btn_add_channel.clicked.connect(_add_channel)
 
+    def _refresh_measure_labels():
+        names = [n for n in (cyto_channel.value, nuc_channel.value) if n]
+        lbl_measure_src.value = ("Measurement source:\n  "
+                                 + "\n  ".join(_measure_note(n) for n in names)
+                                 if names else "Measurement source: (none picked)")
+
+    def _reference_frame_names():
+        """The filenames of the frames the mask was built on, best effort.
+
+        A raw channel folder usually holds more frames than the segmentation ran
+        on, so the raw frames have to be matched to the mask BY NAME. That needs
+        the mask's own frame names, which are looked for in the order they are
+        most likely to be right: the time axis the user pointed at, then the
+        provenance sidecars written next to any stack this tool built.
+        """
+        from . import io_adapters, data_io as _dio
+        tt = time_axis["table"]
+        if tt is not None and "filename" in tt.columns:
+            names = [n for n in tt["filename"].tolist() if n]
+            if len(names) == state.mask.shape[0]:
+                return names, "the loaded time axis"
+        for path in [mask_path] + [os.path.join(work_dir, c.get("file", ""))
+                                   for c in _dio.meta_channels(work_dir)]:
+            if not path:
+                continue
+            names = io_adapters.stack_frame_names(path)
+            if len(names) == state.mask.shape[0]:
+                return names, os.path.basename(path) + ".frames.txt"
+        return [], ""
+
+    def _set_measure_source():
+        """Point a channel's QUANTIFICATION at the raw acquisition.
+
+        The display array is whatever a human can see best; the numbers have to
+        come from the unprocessed frames. Keeping them separate is the only way
+        both stay right, so this never touches what is on screen.
+        """
+        import tifffile
+        from . import io_adapters, channels as chmod, data_io as _dio
+        opts = [L.name for L in _measurable_layers()]
+        name, ok = QInputDialog.getItem(
+            None, "Raw measurement source",
+            "Which channel is this raw source for?\n"
+            f"('{LAYER_RAW}' is the movie the nuclei were segmented from.)",
+            opts, 0, False)
+        if not ok or not name:
+            return
+        L = _layer_by_name(name)
+        choice = QMessageBox.question(
+            None, "Raw source",
+            "Select a FOLDER of individual raw TIF frames?\n"
+            "(No = select a single raw TIF stack file)",
+            QMessageBox.Yes | QMessageBox.No)
+        if choice == QMessageBox.Yes:
+            path = QFileDialog.getExistingDirectory(
+                None, "Select RAW frames folder (unprocessed)", work_dir)
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                None, "Select RAW TIF stack (unprocessed)", work_dir,
+                "TIFF (*.tif *.tiff)")
+        if not path:
+            return
+        n_mask = state.mask.shape[0]
+        picked_note = ""
+        try:
+            if os.path.isdir(path):
+                dest = os.path.join(
+                    work_dir, os.path.basename(path.rstrip("/\\")) + "_measure_stack.tif")
+                files = io_adapters.tif_files_in_folder(path)
+                if len(files) == n_mask:
+                    arr = io_adapters.build_stack_from_files(files, dest)
+                else:
+                    # More raw frames than the segmentation ran on is the normal
+                    # case (frames dropped for focus, interrupted acquisition).
+                    # Pair them by NAME; taking the first n_mask, or trusting
+                    # position, would mis-pair every frame after the first drop.
+                    ref_names, ref_from = _reference_frame_names()
+                    if not ref_names:
+                        return show_error(
+                            f"This folder has {len(files)} frames but the movie "
+                            f"has {n_mask}, and I don't know which frames the "
+                            f"mask was built from.\n\nUse 'Set time axis from "
+                            f"frame folder...' first, pointing at the folder "
+                            f"that was segmented -- then its filenames can be "
+                            f"used to pick the matching raw frames.")
+                    chosen, missing = chmod.match_frames_by_name(files, ref_names)
+                    if missing:
+                        return show_error(
+                            f"{len(missing)} of the {len(ref_names)} frames the "
+                            f"mask was built on have no file in this folder "
+                            f"(e.g. {missing[0]}). Wrong folder, or a different "
+                            f"naming convention.")
+                    arr = io_adapters.build_stack_from_files(chosen, dest)
+                    picked_note = (f"\nMatched by filename against {ref_from}: "
+                                   f"kept {len(chosen)} of {len(files)} frames.")
+            else:
+                arr = tifffile.imread(path)
+        except Exception as exc:
+            return show_error(f"Could not read the raw source: {exc}")
+
+        errors, warnings = chmod.check_measurement_source(
+            arr, mask_frames=state.mask.shape[0],
+            reference=np.asarray(L.data), display=np.asarray(L.data),
+            source_path=path)
+        if errors:
+            return show_error("Cannot use this as a measurement source:\n- "
+                              + "\n- ".join(errors))
+        if warnings:
+            proceed = QMessageBox.warning(
+                None, "Suspicious measurement source",
+                "This source may already be processed:\n- "
+                + "\n- ".join(warnings)
+                + "\n\nUse it anyway?",
+                QMessageBox.Yes | QMessageBox.No)
+            if proceed != QMessageBox.Yes:
+                return
+        L.measure_data = arr
+        L.measure_source = path
+        _refresh_measure_labels()
+        # Frame names carry the acquisition clock; offer the time axis for free.
+        if os.path.isdir(path) and time_axis["table"] is None and not picked_note:
+            _time_axis_from_folder(path, announce=False)
+        show_info(f"'{name}' will be QUANTIFIED from {os.path.basename(path)} "
+                  f"({arr.dtype}); the display stays as it is." + picked_note)
+    btn_measure_source.clicked.connect(_set_measure_source)
+
+    def _time_axis_from_folder(folder=None, announce=True):
+        from . import timeaxis
+        if folder is None:
+            folder = QFileDialog.getExistingDirectory(
+                None, "Select the frame folder (filenames carry the timestamps)",
+                work_dir)
+        if not folder:
+            return
+        try:
+            table = timeaxis.time_table_from_folder(folder)
+        except Exception as exc:
+            return show_error(f"Could not build the time axis: {exc}")
+        if len(table) != state.mask.shape[0]:
+            return show_error(f"That folder has {len(table)} frames, the movie "
+                              f"has {state.mask.shape[0]}. Pick the folder the "
+                              f"mask was built from.")
+        time_axis["table"] = table
+        time_axis["source"] = folder
+        lbl_time_axis.value = "Time axis: " + timeaxis.summarize(table)
+        if announce:
+            show_info(timeaxis.summarize(table))
+    btn_time_axis.clicked.connect(lambda: _time_axis_from_folder())
+
+    def _ring_sweep():
+        """Measure C/N against ring width so the width can be chosen, not guessed.
+
+        A ring only a couple of pixels wide sits inside the nucleus's own
+        out-of-focus halo, where it re-measures the nucleus instead of the
+        cytoplasm. The ratio therefore keeps changing with width until the ring
+        clears the halo -- so the width to use is where the curve flattens.
+        """
+        name = cyto_channel.value
+        stack = _quant_stack_by_name(name)
+        if stack is None:
+            return show_error("Pick a valid Cytoplasm channel.")
+        try:
+            sweep = fluorescence.ring_sweep(
+                stack, state.mask, gap=int(ring_gap.value),
+                neighbor_gap=int(neighbor_gap.value),
+                background_mode=_background_mode_from_choice(bg_roi_layer.value),
+                use_ellipse=bool(use_ellipse_cb.value))
+        except Exception as exc:
+            return show_error(f"Ring sweep failed: {exc}")
+        if sweep.empty:
+            return show_error("Ring sweep produced no rows.")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(1, 2, figsize=(11, 4.2))
+        ax[0].plot(sweep["dilation"], sweep["cn_median"], "o-", color="#C44E52")
+        ax[0].set_xlabel("Ring width (px)"); ax[0].set_ylabel("median C/N")
+        ax[0].set_title("Pick where this flattens", fontweight="bold")
+        ax[0].grid(alpha=0.3)
+        ax[1].plot(sweep["dilation"], sweep["ring_px_median"], "o-", color="#4C72B0",
+                   label="ring px")
+        ax[1].plot(sweep["dilation"], sweep["nuc_px_median"], "--", color="#888",
+                   label="nucleus px")
+        ax[1].set_xlabel("Ring width (px)"); ax[1].set_ylabel("pixels")
+        ax[1].legend(); ax[1].grid(alpha=0.3)
+        ax[1].set_title("Ring size vs nucleus", fontweight="bold")
+        fig.tight_layout()
+        stats.show(fig)
+        out_dir, base = _exports_dir_and_base()
+        sweep.to_csv(os.path.join(out_dir, f"{base}_ring_sweep.csv"), index=False)
+    btn_ring_sweep.clicked.connect(_ring_sweep)
+
     btn_config_channels = PushButton(text="Configure channels (color / measure)...")
 
     def _config_channels():
@@ -1294,12 +1579,13 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     def _ring_preview():
         # Preview the ring geometry over the cytoplasm channel (fallback: nucleus).
         name = cyto_channel.value or nuc_channel.value
-        stack = _channel_stack_by_name(name)
+        stack = _quant_stack_by_name(name)
         try:
             fig = fluorescence.ring_preview_figure(
                 state.mask, stack, track_id=None,
                 dilations=tuple(range(1, int(ring_dilation.value) + 1)) or (1,),
-                gap=int(ring_gap.value), use_ellipse=use_ellipse_cb.value)
+                gap=int(ring_gap.value), use_ellipse=use_ellipse_cb.value,
+                neighbor_gap=int(neighbor_gap.value))
             stats.show(fig)
         except Exception as exc:
             show_error(f"Ring preview failed: {exc}")
@@ -1310,15 +1596,17 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
 
     def _erk_ktr():
         name = cyto_channel.value
-        stack = _channel_stack_by_name(name)
+        stack = _quant_stack_by_name(name)
         if stack is None:
             return show_error("Pick a valid Cytoplasm channel.")
+        show_info(_measure_note(name))
         df = fluorescence.measure_intensity(
             stack, state.mask, channel_name=name,
             dilation=int(ring_dilation.value), gap=int(ring_gap.value),
             background_roi=_roi_from_layer(bg_roi_layer.value),
             background_mode=_background_mode_from_choice(bg_roi_layer.value),
-            use_ellipse=use_ellipse_cb.value)
+            use_ellipse=use_ellipse_cb.value,
+            neighbor_gap=int(neighbor_gap.value), on_warning=show_error)
         if df.empty:
             return show_error("No cells measured.")
         col = f"{name}_cn_ratio"
@@ -1341,21 +1629,29 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
 
     def _dsb_53bp1():
         name = nuc_channel.value
-        stack = _channel_stack_by_name(name)
+        stack = _quant_stack_by_name(name)
         if stack is None:
             return show_error("Pick a valid Nucleus channel.")
+        show_info(_measure_note(name))
         inten = fluorescence.measure_intensity(
             stack, state.mask, channel_name=name,
             dilation=int(ring_dilation.value), gap=int(ring_gap.value),
             background_roi=_roi_from_layer(bg_roi_layer.value),
             background_mode=_background_mode_from_choice(bg_roi_layer.value),
-            use_ellipse=use_ellipse_cb.value)
-        hara = fluorescence.haralick_features(stack, state.mask, channel_name=name)
+            use_ellipse=use_ellipse_cb.value,
+            neighbor_gap=int(neighbor_gap.value), on_warning=show_error)
+        hara = fluorescence.haralick_features(
+            stack, state.mask, channel_name=name,
+            background_mode=_background_mode_from_choice(bg_roi_layer.value))
+        bleach = fluorescence.bleach_factor(stack, state.mask)
         cols = ["track_id", "frame", f"{name}_nuc_median", f"{name}_nuc_std"]
         merged = inten[cols].merge(hara, on=["track_id", "frame"], how="left")
         merged[f"{name}_nuc_cv"] = (
             merged[f"{name}_nuc_std"] /
             merged[f"{name}_nuc_median"].replace(0, np.nan))
+        merged = merged.merge(bleach.rename(
+            columns={"bleach_factor": f"{name}_bleach_factor"}),
+            on="frame", how="left")
         extra_feature_tables.append(merged)
         import os
         out_dir, base = _exports_dir_and_base()
@@ -1387,7 +1683,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
     gradient_value = ComboBox(label="Quantity (Y):", choices=_grad_cols, value="area")
     gradient_group = ComboBox(
         label="Group boxes by (X):",
-        choices=["final_outcome", "treatment", "is_mitotic", "time"],
+        choices=["final_outcome", COL_TREATMENT, "is_mitotic", "time"],
         value="final_outcome")
     btn_gradient = PushButton(text="Plot boxplot + temporal gradient")
 
@@ -1459,7 +1755,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
         # Swap the axis choices to match the selected data source.
         if value == "per-track summary":
             cols = SUMMARY_COLS + [COL_TRACK]
-            grp = ["(none)", "treatment", "final_outcome", "is_mitotic"]
+            grp = ["(none)", COL_TREATMENT, "final_outcome", "is_mitotic"]
         else:
             cols = raw_numeric
             grp = ["(none)"] + list(stats.GROUPING_KEYS)
@@ -1855,9 +2151,12 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                  [custom_source, custom_x, custom_y, custom_group, custom_kind,
                   custom_agg, custom_legend, btn_custom], collapsed=True),
         _section("FLUORESCENCE",
-                 [btn_add_channel, btn_config_channels,
+                 [btn_add_channel, btn_config_channels, btn_measure_source,
+                  lbl_measure_src,
                   cyto_channel, nuc_channel, bg_roi_layer,
-                  ring_dilation, ring_gap, use_ellipse_cb, btn_ring_preview,
+                  ring_dilation, ring_gap, neighbor_gap, use_ellipse_cb,
+                  btn_ring_preview, btn_ring_sweep,
+                  btn_time_axis, lbl_time_axis,
                   btn_erk, btn_53bp1], collapsed=True),
     ]
     stats_host = QWidget()

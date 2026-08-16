@@ -28,7 +28,14 @@ COL_Y = "pos_y"
 COL_OUTCOME = "outcome"
 COL_PARENT = "parent_id"
 COL_CLABEL = "continuous_label"
-COL_TREATMENT = "treatment"
+# The experiment phase a frame belongs to (control / treated / washout). Named
+# "fase" rather than "treatment" because it is a TEMPORAL phase of one movie, not
+# an experimental group: cells cross from one value to the next as the movie
+# runs, so comparing its levels is a before/after within the same cells, not a
+# comparison between arms. Tables written before the rename are migrated on load
+# (see data_io), so older exports keep opening.
+COL_TREATMENT = "fase"
+COL_TREATMENT_LEGACY = "treatment"
 # Separate, "invisible" flag (kept apart from the biological COL_OUTCOME):
 # True when the cell's mask touches the frame border in that frame. Used to
 # truncate / down-weight / impute border-affected measurements in statistics.

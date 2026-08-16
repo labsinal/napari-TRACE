@@ -498,7 +498,7 @@ def compute_track_summary(df, mask, pixel_size=1.0, frame_interval=1.0):
 
         rec = {
             "track_id": int(tid), "first_frame": int(first), "last_frame": int(last),
-            "n_frames": int(n), "lifetime": lifetime, "treatment": treatment,
+            "n_frames": int(n), "lifetime": lifetime, COL_TREATMENT: treatment,
             "is_mitotic": bool(is_mitotic), "final_outcome": final_outcome,
             "total_distance": total, "net_displacement": net,
             "mean_speed": mean_speed, "directionality": directionality,

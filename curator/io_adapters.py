@@ -160,12 +160,39 @@ def looks_like_frame_folder(folder):
 
 
 def build_stack_from_folder(frame_folder, stack_path):
-    paths = tif_files_in_folder(frame_folder)
+    return build_stack_from_files(tif_files_in_folder(frame_folder), stack_path)
+
+
+def build_stack_from_files(paths, stack_path):
+    """Stack the given frame files, recording which ones went in.
+
+    A ``<stack>.frames.txt`` sidecar lists the source filenames in stack order.
+    Once frames become a stack their names are gone, and with them the only
+    record of WHICH frames these are -- which matters as soon as a channel has
+    more frames on disk than the segmentation was run on (frames dropped for
+    focus, an interrupted acquisition). The sidecar is what lets a later channel
+    be matched to this stack by name instead of by position.
+    """
+    paths = list(paths)
     frames = [tifffile.imread(p) for p in paths]
     stack = np.stack(frames, axis=0)
     tifffile.imwrite(stack_path, stack)
+    try:
+        with open(stack_path + ".frames.txt", "w", encoding="utf-8") as fh:
+            fh.write("\n".join(os.path.basename(p) for p in paths))
+    except OSError:
+        pass                      # provenance is a bonus, never a blocker
     print(f"Built stack from {len(frames)} frames -> {stack_path}")
     return stack
+
+
+def stack_frame_names(stack_path):
+    """Source filenames recorded for a stack, or [] when none were recorded."""
+    side = str(stack_path) + ".frames.txt"
+    if not os.path.exists(side):
+        return []
+    with open(side, encoding="utf-8") as fh:
+        return [ln.strip() for ln in fh if ln.strip()]
 
 
 def resolve_paths(folder):

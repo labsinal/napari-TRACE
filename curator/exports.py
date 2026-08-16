@@ -82,8 +82,16 @@ def subset_tracks(df, track_ids):
 # ---------------------------------------------------------------------------
 def features_table(df, mask, pixel_size=1.0, frame_interval=1.0,
                    channels=None, ring_opts=None, texture=True,
-                   extra_tables=None):
-    """One row per (track, frame): morphometry + per-step migration."""
+                   extra_tables=None, time_table=None):
+    """One row per (track, frame): morphometry + per-step migration.
+
+    ``time_table`` (see :mod:`curator.timeaxis`) supplies the real acquisition
+    time per frame. When given, ``speed`` is divided by the ACTUAL hours between
+    consecutive observations of that cell, so a step that spans a dropped frame
+    is not reported as if it had taken one interval, and the row is flagged with
+    ``gap_antes``. Without it every step is assumed to be ``frame_interval``
+    long, which is the historical behaviour.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     d = df.dropna(subset=[COL_TRACK, COL_FRAME, COL_X, COL_Y]).copy()
@@ -112,7 +120,23 @@ def features_table(df, mask, pixel_size=1.0, frame_interval=1.0,
     y0 = d.groupby(COL_TRACK)[COL_Y].transform("first").to_numpy(float)
     out["net_disp"] = np.sqrt(((d[COL_X].to_numpy(float) - x0) * pixel_size) ** 2 +
                               ((d[COL_Y].to_numpy(float) - y0) * pixel_size) ** 2)
-    out["speed"] = step / frame_interval if frame_interval else step
+
+    # Elapsed time per step. Taken between consecutive observations OF THIS CELL,
+    # so it absorbs both frames missing from the stack and holes inside a track.
+    if time_table is not None and not time_table.empty:
+        t_of = dict(zip(time_table["frame"].astype(int),
+                        time_table["tempo_h"].astype(float)))
+        tempo = d[COL_FRAME].map(t_of).astype(float)
+        out["tempo_h"] = tempo.to_numpy()
+        dt = tempo.groupby(d[COL_TRACK]).diff().to_numpy(float)
+        modal = float(time_table.attrs.get("modal_interval_h", np.nan))
+        out["gap_antes"] = (dt > modal + 1e-6) if np.isfinite(modal) else False
+    else:
+        dt = (d.groupby(COL_TRACK)[COL_FRAME].diff().to_numpy(float)
+              * float(frame_interval))
+        out["gap_antes"] = False
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["speed"] = np.where(dt > 0, step / dt, np.nan)
 
     # Nuclear morphometry merged from the mask.
     if mask is not None:
@@ -125,18 +149,21 @@ def features_table(df, mask, pixel_size=1.0, frame_interval=1.0,
     ropts = ring_opts or {}
     dil = int(ropts.get("dilation", fluorescence.RING_DILATION_DEFAULT))
     gap = int(ropts.get("gap", fluorescence.RING_GAP_DEFAULT))
-    bg_mode = ropts.get("background_mode", "non_cell_median")
+    bg_mode = ropts.get("background_mode", "far_from_cells")
     use_ellipse = bool(ropts.get("use_ellipse", False))
+    ngap = int(ropts.get("neighbor_gap", fluorescence.NEIGHBOR_GAP_DEFAULT))
     for name, stack in (channels or {}).items():
         inten = fluorescence.measure_intensity(stack, mask, channel_name=name,
                                                dilation=dil, gap=gap,
                                                background_mode=bg_mode,
-                                               use_ellipse=use_ellipse)
+                                               use_ellipse=use_ellipse,
+                                               neighbor_gap=ngap)
         if not inten.empty:
             inten = inten.rename(columns={"track_id": COL_TRACK, "frame": COL_FRAME})
             out = out.merge(inten, on=[COL_TRACK, COL_FRAME], how="left")
         if texture:
-            hara = fluorescence.haralick_features(stack, mask, channel_name=name)
+            hara = fluorescence.haralick_features(stack, mask, channel_name=name,
+                                                  background_mode=bg_mode)
             if not hara.empty:
                 hara = hara.rename(columns={"track_id": COL_TRACK, "frame": COL_FRAME})
                 out = out.merge(hara, on=[COL_TRACK, COL_FRAME], how="left")
@@ -152,27 +179,51 @@ def features_table(df, mask, pixel_size=1.0, frame_interval=1.0,
             e = e.drop(columns=dup)
             out = out.merge(e, on=merge_cols, how="left")
 
+    # Lineage root, constant along the whole track. parent_id is carried only on
+    # a daughter's FIRST row (the frame the division happened), which is the
+    # correct encoding but makes any per-track reduction other than .first()
+    # silently lose the link; root_id is the per-track key lineage analysis
+    # actually wants.
+    if COL_PARENT in out.columns:
+        p_of = lineage.parent_of(out)
+        cache = {}
+        roots = {int(t): int(lineage._root_in_map(p_of, int(t), cache))
+                 for t in out[COL_TRACK].unique()}
+        out["root_id"] = out[COL_TRACK].map(roots)
+
     out = out.reset_index(drop=True)
-    _add_lifetime_midframe(out, frame_interval)
+    _add_lifetime_midframe(out, frame_interval, time_table=time_table)
     return out
 
 
-def _add_lifetime_midframe(out, frame_interval=1.0):
+def _add_lifetime_midframe(out, frame_interval=1.0, time_table=None):
     """Add a per-track ``lifetime`` carried on the middle-of-life row only.
 
-    ``lifetime = (last_frame - first_frame + 1) * frame_interval`` is written on
-    the single (track, frame) row at the centre of the track's frames; every
-    other row is NaN. This gives exactly one value per cell for averaging, and
-    puts it away from the ends so trimming the first/last frames in a later
-    cleanup never drops it. Operates in place on ``out``.
+    Written on the single (track, frame) row at the centre of the track's
+    frames; every other row is NaN. This gives exactly one value per cell for
+    averaging, and puts it away from the ends so trimming the first/last frames
+    in a later cleanup never drops it. Operates in place on ``out``.
+
+    With a ``time_table`` the lifetime is the real elapsed hours the cell was
+    observed; otherwise it is ``(last - first + 1) * frame_interval``, i.e. in
+    frames unless a physical interval was supplied.
     """
     out["lifetime"] = np.nan
     if out.empty:
         return out
+    t_of = None
+    if time_table is not None and not time_table.empty:
+        t_of = dict(zip(time_table["frame"].astype(int),
+                        time_table["tempo_h"].astype(float)))
     for _tid, g in out.groupby(COL_TRACK):
         g = g.sort_values(COL_FRAME)
         frames = g[COL_FRAME].to_numpy(dtype=float)
-        lifetime = (frames.max() - frames.min() + 1) * frame_interval
+        if t_of is not None:
+            times = g[COL_FRAME].map(t_of).to_numpy(dtype=float)
+            span = np.nanmax(times) - np.nanmin(times)
+            lifetime = span + float(time_table.attrs.get("modal_interval_h", 0.0))
+        else:
+            lifetime = (frames.max() - frames.min() + 1) * frame_interval
         mid_label = g.index[len(g) // 2]        # middle row in frame order
         out.loc[mid_label, "lifetime"] = lifetime
     return out
@@ -191,7 +242,7 @@ def _first_last_finite(v):
 
 
 def windows_table(df, mask, window=7, pixel_size=1.0, frame_interval=1.0,
-                  feats=None):
+                  feats=None, time_table=None):
     """Sliding-window (per-frame) accumulated table, one row per (track, frame).
 
     For every frame the metrics are accumulated over a window of ``window``
@@ -205,9 +256,14 @@ def windows_table(df, mask, window=7, pixel_size=1.0, frame_interval=1.0,
     window = max(2, int(window))
     half = max(1, window // 2)
     feats = feats or _FEATURE_COLS
-    base = features_table(df, mask, pixel_size, frame_interval)
+    base = features_table(df, mask, pixel_size, frame_interval,
+                          time_table=time_table)
     if base is None or base.empty:
         return pd.DataFrame()
+    t_of = None
+    if time_table is not None and not time_table.empty:
+        t_of = dict(zip(time_table["frame"].astype(int),
+                        time_table["tempo_h"].astype(float)))
 
     rows = []
     for tid, g in base.groupby(COL_TRACK):
@@ -226,7 +282,13 @@ def windows_table(df, mask, window=7, pixel_size=1.0, frame_interval=1.0,
             step = np.sqrt(np.diff(wx) ** 2 + np.diff(wy) ** 2)
             path = float(step.sum())
             net = float(np.sqrt((wx[-1] - wx[0]) ** 2 + (wy[-1] - wy[0]) ** 2))
-            span = (fr[-1] - fr[0]) * frame_interval
+            # Real hours covered by the window when a time table is available,
+            # so speed_mean is not inflated by windows that straddle a gap.
+            if t_of is not None:
+                span = float(t_of.get(int(fr[-1]), np.nan)
+                             - t_of.get(int(fr[0]), np.nan))
+            else:
+                span = (fr[-1] - fr[0]) * frame_interval
             rec = {
                 COL_TRACK: int(tid),
                 "frame_center": int(frames[c]),
@@ -235,7 +297,7 @@ def windows_table(df, mask, window=7, pixel_size=1.0, frame_interval=1.0,
                 "displacement": net, "delta_path": path,
                 "persistence": (net / path) if path > 0 else np.nan,
                 "path": path, "net": net,
-                "speed_mean": (path / span) if span > 0 else np.nan,
+                "speed_mean": (path / span) if (np.isfinite(span) and span > 0) else np.nan,
             }
             area = g["area_px"].to_numpy(float)[sl] if "area_px" in g else np.array([])
             af = area[np.isfinite(area)] if area.size else area
@@ -271,11 +333,18 @@ def _atomic_csv(frame, path):
 
 def write_all(work_dir, df, mask, reviewed_roots, validated_cells, base_name,
               window=7, pixel_size=1.0, frame_interval=1.0,
-              channels=None, ring_opts=None, extra_tables=None):
+              channels=None, ring_opts=None, extra_tables=None,
+              time_table=None, provenance=None):
     """Write every derived table (full + validated) into ``work_dir/exports``.
 
     Returns a dict of {key: path} for the files written and the count of
     validated tracks.
+
+    ``provenance`` is recorded next to the tables as
+    ``<base_name>_measurement_provenance.json``: which file each measured
+    channel was quantified from, its dtype, the ring geometry and the background
+    method. A number whose origin is not written down is a number nobody can
+    check later, and the display array is not the measurement array.
     """
     out_dir = os.path.join(work_dir, "exports")
     os.makedirs(out_dir, exist_ok=True)
@@ -284,8 +353,9 @@ def write_all(work_dir, df, mask, reviewed_roots, validated_cells, base_name,
 
     features = features_table(df, mask, pixel_size, frame_interval,
                               channels=channels, ring_opts=ring_opts,
-                              extra_tables=extra_tables)
-    windows = windows_table(df, mask, window, pixel_size, frame_interval)
+                              extra_tables=extra_tables, time_table=time_table)
+    windows = windows_table(df, mask, window, pixel_size, frame_interval,
+                            time_table=time_table)
     summary = analysis.compute_track_summary(df, mask, pixel_size, frame_interval)
     validated_main = subset_tracks(df, valid_ids)
 
@@ -310,6 +380,18 @@ def write_all(work_dir, df, mask, reviewed_roots, validated_cells, base_name,
         if chan_cols:
             fl_only = features[[COL_TRACK, COL_FRAME] + chan_cols]
             written["fluorescence"] = _atomic_csv(fl_only, p("fluorescence"))
+
+    if time_table is not None and not time_table.empty:
+        written["time_index"] = _atomic_csv(time_table, p("time_index"))
+
+    if provenance:
+        import json
+        prov_path = os.path.join(out_dir, f"{base_name}_measurement_provenance.json")
+        tmp = prov_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(provenance, fh, indent=2, ensure_ascii=False, default=str)
+        os.replace(tmp, prov_path)
+        written["provenance"] = prov_path
     return {"files": {k: v for k, v in written.items() if v},
             "n_validated_tracks": len(valid_ids),
             "dir": out_dir}

@@ -343,6 +343,101 @@ def test_cn_and_nc_ratios_mean_and_median_are_independent():
     assert abs(row["g_nc_ratio_mean"] - 0.5) < 1e-9    # 25 / 50 (mean)
 
 
+def _one_nucleus_stack(shape=(1, 20, 20)):
+    mask = np.zeros(shape, dtype=np.int32)
+    mask[0, 6:12, 6:12] = 1
+    return mask
+
+
+def test_vanished_ring_gives_nan_not_zero():
+    """A ring clipped to zero must be NaN, not a 0.0 that reads as 'no signal'."""
+    mask = _one_nucleus_stack()
+    ch = np.zeros((1, 20, 20), dtype=float)
+    ch[0][mask[0] == 1] = 100.0            # nucleus bright, everything else 0
+    df = fl.measure_intensity(ch, mask, channel_name="g",
+                              subtract_background=False)
+    row = df.iloc[0]
+    assert row["g_ring_median"] == 0.0     # the ring really did measure zero
+    assert row["g_ring_px"] > 0            # ...and it was not an empty ring
+    assert np.isnan(row["g_cn_ratio"])     # so the ratio is missing, not zero
+    assert np.isnan(row["g_nc_ratio"])
+    assert np.isnan(row["g_cn_ratio_mean"])
+
+
+def test_compartment_pixel_counts_are_reported():
+    mask = _one_nucleus_stack()
+    ch = np.ones((1, 20, 20), dtype=float)
+    df = fl.measure_intensity(ch, mask, channel_name="g",
+                              subtract_background=False)
+    row = df.iloc[0]
+    assert row["g_nuc_px"] == 36           # 6x6 nucleus
+    assert row["g_ring_px"] > 0
+    assert row["g_cell_px"] == row["g_nuc_px"] + row["g_ring_px"]
+
+
+def test_absent_id_ring_is_empty_not_measured():
+    mask = _one_nucleus_stack()
+    m = fl.compartment_masks(mask[0], track_id=99)
+    assert fl._compartment_stats(np.array([]))["px"] == 0.0
+    assert m["ring"].sum() == 0
+
+
+def test_neighbor_gap_shrinks_ring_away_from_neighbour():
+    p = _two_nuclei_plane()
+    near = fl.compartment_masks(p, 1, dilation=4, gap=1, neighbor_gap=0)
+    far = fl.compartment_masks(p, 1, dilation=4, gap=1, neighbor_gap=3)
+    assert far["ring"].sum() < near["ring"].sum()
+    assert not (far["ring"] & (p == 2)).any()
+
+
+def test_background_far_from_cells_ignores_perinuclear_cytoplasm():
+    """The confluence-driven bias: cytoplasm near nuclei must not set the floor.
+
+    The naive estimator only breaks once cytoplasm is the MAJORITY of the
+    non-nucleus area, which is exactly what a filling colony produces -- so the
+    field here is built confluent on purpose.
+    """
+    p = np.zeros((40, 40), dtype=np.int32)
+    p[16:24, 16:24] = 1                    # nucleus, 64 px
+    ch = np.full((40, 40), 5.0)            # true background
+    halo = np.zeros_like(p, dtype=bool)
+    halo[4:36, 4:36] = True                # cytoplasm: 960 of 1536 non-nucleus px
+    ch[halo & (p == 0)] = 40.0
+    ch[p == 1] = 200.0
+    naive = fl.background_per_frame(ch, p)
+    far, frac = fl.background_far_from_cells(ch, p, dilate_px=14)
+    assert naive == 40.0                   # counts cytoplasm as background
+    assert far == 5.0                      # sees the real floor
+    assert 0.0 < frac < 0.5                # only the rim is genuinely free
+
+
+def test_background_far_from_cells_falls_back_when_field_is_full():
+    p = np.ones((10, 10), dtype=np.int32)  # every pixel is a nucleus
+    ch = np.full((10, 10), 7.0)
+    value, frac = fl.background_far_from_cells(ch, p, dilate_px=2)
+    assert frac == 0.0
+    assert value == fl.background_per_frame(ch, p)
+
+
+def test_ring_sweep_reports_growing_ring():
+    mask = _one_nucleus_stack()
+    ch = np.ones((1, 20, 20), dtype=float)
+    sweep = fl.ring_sweep(ch, mask, dilations=(1, 2, 3), gap=1,
+                          subtract_background=False)
+    assert list(sweep["dilation"]) == [1, 2, 3]
+    assert sweep["ring_px_median"].is_monotonic_increasing
+
+
+def test_bleach_factor_tracks_signal_decay():
+    mask = np.zeros((3, 10, 10), dtype=np.int32)
+    mask[:, 3:7, 3:7] = 1
+    ch = np.zeros((3, 10, 10), dtype=float)
+    for f, level in enumerate((100.0, 50.0, 25.0)):
+        ch[f][mask[f] == 1] = level
+    bf = fl.bleach_factor(ch, mask)
+    assert list(bf["bleach_factor"]) == [1.0, 0.5, 0.25]
+
+
 if __name__ == "__main__":
     import matplotlib
     matplotlib.use("Agg")

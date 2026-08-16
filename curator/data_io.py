@@ -23,7 +23,7 @@ import tifffile
 from . import config
 from .config import (
     COL_TRACK, COL_FRAME, COL_X, COL_Y, COL_OUTCOME, COL_PARENT, COL_CLABEL,
-    COL_TREATMENT, OUTCOME_MITOSIS, TREAT_CONTROL, COL_BORDER,
+    COL_TREATMENT, COL_TREATMENT_LEGACY, OUTCOME_MITOSIS, TREAT_CONTROL, COL_BORDER,
 )
 from . import io_adapters
 
@@ -216,6 +216,10 @@ def load_data(csv_path, mask_path, image_path, column_map,
 
     if COL_CLABEL not in df.columns:
         df[COL_CLABEL] = df[COL_TRACK]
+    # Tables written before the phase column was renamed carry "treatment".
+    # Migrate them so every CSV this tool has ever produced still opens.
+    if COL_TREATMENT not in df.columns and COL_TREATMENT_LEGACY in df.columns:
+        df = df.rename(columns={COL_TREATMENT_LEGACY: COL_TREATMENT})
     if COL_TREATMENT not in df.columns:
         df[COL_TREATMENT] = TREAT_CONTROL
 

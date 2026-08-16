@@ -8,7 +8,7 @@ Contains the existing research plots plus two requested additions:
     quantity drifts in a consistent direction over time.
 
   * Customizable plotting: pick any numeric column for X and Y and a grouping
-    key (frame, track_id, treatment or outcome) and get a scatter / mean-line.
+    key (frame, track_id, fase or outcome) and get a scatter / mean-line.
 
 All figures are produced with matplotlib; the module never imports Qt directly.
 """
@@ -71,8 +71,14 @@ def box_with_points(ax, groups, title, ylabel):
 
 
 def shade_treatment(ax, treatment_config, max_frame):
-    """Shade treated and washout windows on a time-axis plot."""
-    if treatment_config["mode"] != TREAT_TREATED:
+    """Shade treated and washout windows on a time-axis plot.
+
+    A missing config means "no phases defined", which is a control-only movie,
+    not an error: nothing to shade, and the plot around it stays valid.
+    """
+    if not treatment_config:
+        return
+    if treatment_config.get("mode") != TREAT_TREATED:
         return
     start = treatment_config["start"]
     end = treatment_config["end"]
@@ -89,7 +95,7 @@ def shade_treatment(ax, treatment_config, max_frame):
 _GRADIENT_GROUP_LABELS = {
     "final_outcome": "Outcome",
     "outcome": "Outcome",
-    "treatment": "Treatment",
+    COL_TREATMENT: "Phase",
     "is_mitotic": "Mitotic?",
     "time": "Time window",
 }
@@ -98,8 +104,8 @@ _GRADIENT_GROUP_LABELS = {
 def _group_for_cellframe(df, group_by):
     """Map (frame, track) -> group label for a categorical grouping key.
 
-    Supports 'final_outcome'/'outcome' (each track's final fate), 'treatment'
-    (per-row treatment phase) and 'is_mitotic' (track is a mother / flagged
+    Supports 'final_outcome'/'outcome' (each track's final fate), 'fase'
+    (per-row experiment phase) and 'is_mitotic' (track is a mother / flagged
     Mitosis). Returns a dict keyed by (int frame, int track). Used to colour a
     cell/frame point's box by an attribute of its track rather than by time.
     """
@@ -126,7 +132,7 @@ def _group_for_cellframe(df, group_by):
             ti = int(t)
             is_mito = ti in mothers or per_track.get(ti) == "Mitosis"
             lookup[(int(f), ti)] = "Mitotic" if is_mito else "Non-mitotic"
-    elif group_by == "treatment":
+    elif group_by == COL_TREATMENT:
         col = d[COL_TREATMENT] if COL_TREATMENT in d.columns else None
         for i, (f, t) in enumerate(zip(d[COL_FRAME], d[COL_TRACK])):
             lookup[(int(f), int(t))] = (str(col.iloc[i]) if col is not None
@@ -147,7 +153,7 @@ def gradient_over_time(df, mask, value="area", pixel_size=1.0, frame_interval=1.
     ``group_by`` selects what the X axis (the boxes) represents:
       - "final_outcome" : one box per final fate (Mitose / Fim / ...). This is
         the example case: X = outcome, Y = area over all frames of those cells.
-      - "treatment"     : one box per treatment phase (control/treated/washout).
+      - "fase"          : one box per experiment phase (control/treated/washout).
       - "is_mitotic"    : mitotic vs non-mitotic tracks.
       - "time"          : bin frames into ``n_time_bins`` equal time windows
         (the legacy "by time" view).
@@ -207,7 +213,7 @@ def gradient_over_time(df, mask, value="area", pixel_size=1.0, frame_interval=1.
         # Order the boxes sensibly per grouping; unknown labels go last.
         if group_by in ("final_outcome", "outcome"):
             preferred = ["Mitosis", "Exit", "Death/Senescence", "Ambiguous", "No outcome"]
-        elif group_by == "treatment":
+        elif group_by == COL_TREATMENT:
             preferred = [TREAT_CONTROL, TREAT_TREATED, TREAT_WASHOUT]
         elif group_by == "is_mitotic":
             preferred = ["Mitotic", "Non-mitotic"]
@@ -275,7 +281,7 @@ def custom_plot(df, x_col, y_col, group_by=None, agg="mean", kind="scatter",
     Parameters
     ----------
     group_by : str or None
-        A column to group by (e.g. frame, track_id, treatment, outcome). When
+        A column to group by (e.g. frame, track_id, fase, outcome). When
         set with ``kind='line'`` the aggregated value per x is drawn per group.
     agg : {'mean','median','sum','count'}
         Aggregation used when grouping for a line plot.
@@ -397,7 +403,7 @@ def _shade_tmz(ax, treatment_config):
 
     Returns the matplotlib handle of the band (or None) so the caller can build
     a combined legend. Unlike shade_treatment(), this draws no legend itself and
-    uses the figures' pink rather than the by-treatment palette.
+    uses the figures' pink rather than the by-phase palette.
     """
     if not treatment_config or treatment_config.get("mode") != TREAT_TREATED:
         return None
@@ -904,25 +910,25 @@ def length_unit(pixel_size):
 
 
 def lifetime_figure(summary, frame_interval):
-    treat_groups = {t: summary.loc[summary.treatment == t, "lifetime"].values
-                    for t in summary.treatment.unique()}
+    treat_groups = {t: summary.loc[summary[COL_TREATMENT] == t, "lifetime"].values
+                    for t in summary[COL_TREATMENT].unique()}
     mito_groups = {
         "mitotic": summary.loc[summary.is_mitotic, "lifetime"].values,
         "non-mitotic": summary.loc[~summary.is_mitotic, "lifetime"].values,
     }
     unit = time_unit(frame_interval)
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    box_with_points(axes[0], treat_groups, "Lifetime by treatment", f"Lifetime ({unit})")
+    box_with_points(axes[0], treat_groups, "Lifetime by phase", f"Lifetime ({unit})")
     box_with_points(axes[1], mito_groups, "Lifetime: mitotic vs non-mitotic", f"Lifetime ({unit})")
     return fig
 
 
 def migration_figure(summary, pixel_size, frame_interval):
     lu, tu = length_unit(pixel_size), time_unit(frame_interval)
-    groups = sorted(summary.treatment.unique())
-    speed = {t: summary.loc[summary.treatment == t, "mean_speed"].values for t in groups}
-    disp = {t: summary.loc[summary.treatment == t, "net_displacement"].values for t in groups}
-    direction = {t: summary.loc[summary.treatment == t, "directionality"].values for t in groups}
+    groups = sorted(summary[COL_TREATMENT].unique())
+    speed = {t: summary.loc[summary[COL_TREATMENT] == t, "mean_speed"].values for t in groups}
+    disp = {t: summary.loc[summary[COL_TREATMENT] == t, "net_displacement"].values for t in groups}
+    direction = {t: summary.loc[summary[COL_TREATMENT] == t, "directionality"].values for t in groups}
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     box_with_points(axes[0], speed, "Mean speed", f"Speed ({lu}/{tu})")
     box_with_points(axes[1], disp, "Net displacement", f"Displacement ({lu})")
@@ -931,12 +937,12 @@ def migration_figure(summary, pixel_size, frame_interval):
 
 
 def motility_figure(summary, pixel_size, frame_interval):
-    """Boxplots of the richer motility metrics by treatment."""
+    """Boxplots of the richer motility metrics by experiment phase."""
     lu, tu = length_unit(pixel_size), time_unit(frame_interval)
-    groups = sorted(summary.treatment.unique())
+    groups = sorted(summary[COL_TREATMENT].unique())
 
     def by_group(col):
-        return {t: summary.loc[summary.treatment == t, col].dropna().values for t in groups}
+        return {t: summary.loc[summary[COL_TREATMENT] == t, col].dropna().values for t in groups}
 
     fig, axes = plt.subplots(1, 4, figsize=(18, 5))
     box_with_points(axes[0], by_group("diffusion_coeff"),
@@ -1025,8 +1031,8 @@ def msd_figure(df, pixel_size, frame_interval, max_lag=20):
 
 def area_figure(summary, df, mask, pixel_size, treatment_config, max_frame):
     lu = length_unit(pixel_size)
-    area_groups = {t: summary.loc[summary.treatment == t, "mean_area"].values
-                   for t in sorted(summary.treatment.unique())}
+    area_groups = {t: summary.loc[summary[COL_TREATMENT] == t, "mean_area"].values
+                   for t in sorted(summary[COL_TREATMENT].unique())}
     px_area = pixel_size ** 2
     frames, mean_areas = [], []
     for f in range(mask.shape[0]):
@@ -1035,7 +1041,7 @@ def area_figure(summary, df, mask, pixel_size, treatment_config, max_frame):
             frames.append(f)
             mean_areas.append(np.mean(sizes))
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    box_with_points(axes[0], area_groups, "Mean area by treatment", f"Area ({lu}^2)")
+    box_with_points(axes[0], area_groups, "Mean area by phase", f"Area ({lu}^2)")
     axes[1].plot(frames, mean_areas, color="#4C72B0", linewidth=2)
     axes[1].set_title("Mean cell area over time", fontweight="bold")
     axes[1].set_xlabel("Frame")
