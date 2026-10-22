@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from scipy import ndimage as ndi
-from skimage.feature import graycomatrix, graycoprops
+from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
 
 RING_DILATION_DEFAULT = 2
 RING_GAP_DEFAULT = 1
@@ -489,6 +489,76 @@ def haralick_features(channel_stack, mask, channel_name="ch", levels=16,
             rec = {"frame": int(f), "track_id": int(tid)}
             for c in _HARA_COLS:
                 rec[f"{channel_name}_hara_{c}"] = hd[c]
+            rows.append(rec)
+    out = pd.DataFrame(rows, columns=cols)
+    # Which range these columns were binned over is not recoverable from the
+    # CSV, and the CSV travels without the JSON. Carried here so write_all can
+    # put it in the provenance sidecar: a global range makes a brighter nucleus
+    # land in higher bins, so contrast tracks intensity by construction
+    # (Spearman +0.90 on C4_4). Whoever reads the texture columns needs to know.
+    out.attrs["texture"] = {
+        "quantisation": "global", "levels": int(levels),
+        "vmin": float(vmin), "vmax": float(vmax),
+        "distances": [1], "angles": len(_HARA_ANGLES),
+        "background_mode": background_mode if subtract_background else None,
+    }
+    return out
+
+
+_LBP_P, _LBP_R = 8, 1
+_LBP_COLS = ("localmax", "localmin", "entropy")
+
+
+def lbp_features(channel_stack, mask, channel_name="ch"):
+    """Per (frame, track_id) Local Binary Pattern texture on the nuclear ROI.
+
+    Complements :func:`haralick_features` rather than repeating it. The LBP
+    compares each pixel with its 8 neighbours and keeps only the ranking, so it
+    is invariant to any monotonic change of intensity -- scaling, offset, and
+    the global part of photobleaching. That is the whole point, and it has three
+    consequences the implementation depends on:
+
+    * **No background subtraction.** Subtracting a per-frame constant cannot
+      change a ranking, and clipping at zero would only invent ties.
+    * **No quantisation, and no vmin/vmax.** There is no range to choose, hence
+      no range to choose wrongly -- unlike Haralick, whose global range makes
+      contrast follow brightness by construction.
+    * **The mask is eroded by 1 px before histogramming.** A rim pixel has
+      neighbours outside the nucleus, in background: it always ranks as a local
+      maximum, and an uneroded mask reports the outline of the segmentation as
+      if it were texture inside the nucleus.
+
+    ``localmax`` is the fraction of pixels brighter than all 8 neighbours (the
+    punctate signature: foci, autophagy puncta), ``localmin`` its dark
+    counterpart, ``entropy`` the spread of the whole code histogram. Only these
+    three are exported: on C4_4, energy is -0.99 against entropy and var_code
+    passes 0.85 against four of the others (measured within track).
+
+    Nuclei with fewer than 8 pixels left after erosion yield a NaN row, not a
+    missing one, matching :func:`haralick_features`.
+    """
+    cols = ["frame", "track_id"] + [f"{channel_name}_lbp_{c}" for c in _LBP_COLS]
+    if channel_stack is None or mask is None:
+        return pd.DataFrame(columns=cols)
+    n_bins = _LBP_P + 2
+    rows = []
+    for f in range(mask.shape[0]):
+        lab = mask[f]
+        codes = local_binary_pattern(channel_stack[f], _LBP_P, _LBP_R, "uniform")
+        ids = np.unique(lab)
+        for tid in ids[ids > 0]:
+            nuc = ndi.binary_erosion(lab == int(tid))
+            rec = {"frame": int(f), "track_id": int(tid)}
+            if nuc.sum() < 8:
+                for c in _LBP_COLS:
+                    rec[f"{channel_name}_lbp_{c}"] = np.nan
+            else:
+                h, _ = np.histogram(codes[nuc], bins=n_bins, range=(0, n_bins),
+                                    density=True)
+                hs = h + 1e-12
+                rec[f"{channel_name}_lbp_localmax"] = float(h[0])
+                rec[f"{channel_name}_lbp_localmin"] = float(h[_LBP_P])
+                rec[f"{channel_name}_lbp_entropy"] = float(-(hs * np.log(hs)).sum())
             rows.append(rec)
     return pd.DataFrame(rows, columns=cols)
 

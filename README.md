@@ -91,6 +91,8 @@ Python dependencies (see [`requirements.txt`](requirements.txt)):
   option falls back to linear automatically
 - `matplotlib`
 - `imageio[ffmpeg]` — optional, only for the video-export buttons
+- `opencv-python-headless` — optional (the `align` extra), only for the
+  channel-alignment check; without it that one check is skipped and says so
 
 A working display is required: napari is an interactive GUI and will not run on
 a headless server without a virtual display.
@@ -99,36 +101,102 @@ a headless server without a virtual display.
 
 ## Installation
 
-A clean conda environment is recommended. Conda creates the environment and the
-Python interpreter; the packages are installed with `pip` from
-`requirements.txt`.
+### From PyPI (what most users want)
+
+napari-TRACE is published on PyPI, and the install brings napari and its Qt
+backend along with it, so this is the whole thing:
 
 ```bash
-# 1. Create the environment (Python 3.10 or 3.11 work well with napari)
-conda create -n curator python=3.11
-
-# 2. Activate it
-conda activate curator
-
-# 3. Install the dependencies
-pip install -r requirements.txt
+pip install napari-TRACE
 ```
 
-Notes:
-
-- `requirements.txt` installs napari and its Qt backend through `napari[all]`.
-  Do **not** also run `conda install napari` in the same environment; installing
-  napari through two package managers commonly produces a broken Qt backend.
-- If you prefer napari from conda-forge, use
-  `conda create -n curator -c conda-forge napari pyqt` and then
-  `pip install -r requirements.txt` for the rest, after removing the
-  `napari[all]` line from `requirements.txt`.
-
-Plain pip (no conda) also works:
+Then launch it:
 
 ```bash
-pip install -r requirements.txt
+napari-trace
 ```
+
+Install into a **fresh** environment (see the warnings below). With conda
+providing the interpreter:
+
+```bash
+conda create -n trace python=3.11
+```
+
+```bash
+conda activate trace
+```
+
+```bash
+pip install napari-TRACE
+```
+
+### If you load extra fluorescence channels, add the `align` extra
+
+```bash
+pip install "napari-TRACE[align]"
+```
+
+The channel loader verifies, by phase correlation, that an extra channel really
+is registered against the movie the mask was built on. That check -- and only
+that check -- needs OpenCV, which is why it is optional. Without it the loader
+still works, but it reports that the alignment was **not** verified. Install the
+extra if you intend to *measure* a channel: one that sits a few pixels off
+yields correlations that describe the misalignment rather than the biology.
+
+### Five things that will bite you
+
+- **Install into a clean environment.** napari-TRACE requires
+  `napari>=0.5,<0.6`. If the environment already holds napari 0.6, pip
+  **downgrades** it, which can break other napari plugins installed there.
+- **Python 3.10, 3.11 or 3.12 only.** The napari 0.5 pin rules out 3.13+, and on
+  3.13 pip fails with an unhelpful "could not find a version that satisfies the
+  requirement napari-TRACE".
+- **Do not install napari twice.** Let pip pull `napari[all]`; adding
+  `conda install napari` on top of it commonly produces a broken Qt backend.
+- **Despite the name, this is not a plugin-manager plugin.** napari-TRACE is a
+  desktop application *built on* napari: it opens its own viewer and is launched
+  from the command line. It registers no napari widget, so it does not appear
+  under napari's Plugins menu or on the napari hub.
+- **A real display is required.** napari is an interactive GUI and will not run
+  on a headless server without a virtual display.
+
+### Check that it worked
+
+```bash
+pip show napari-TRACE
+```
+
+Every launch also prints one line naming the versions actually in use:
+
+```text
+napari-TRACE 0.7.0 | python 3.11.9 | numpy 2.2.6 | pandas 2.3.3 | scikit-image 0.25.2 | napari 0.5.6
+```
+
+Keep that line with your results. Shape and texture features are computed
+through scikit-image, and its minor versions can return slightly different
+values for the same image -- which is why the dependency is capped at
+`>=0.24,<0.26`. If you need identical numbers across two machines, pin the exact
+version yourself in both.
+
+### From source (development)
+
+```bash
+conda create -n trace python=3.11
+```
+
+```bash
+conda activate trace
+```
+
+```bash
+pip install -e .
+```
+
+`pip install -r requirements.txt` also works, but `requirements.txt` carries no
+version bounds, whereas `pip install -e .` applies exactly the same pins as the
+published package. Either way, launch with `napari-trace`, or with
+`python run_curator.py` from the directory that contains `curator/`.
 
 ---
 
@@ -178,15 +246,30 @@ next to it.
 
 ## Running
 
+If you installed from PyPI, use the command the installer put on your PATH:
+
+```bash
+napari-trace /path/to/experiment_folder
+```
+
+From a clone, the equivalent entry point is `run_curator.py`, run from the
+directory that contains `curator/`:
+
 ```bash
 python run_curator.py /path/to/experiment_folder
 ```
 
-The folder argument is optional. Without it, a folder-picker dialog opens:
+The folder argument is optional. Without it, a folder-picker dialog opens and
+you point it at the experiment folder:
 
 ```bash
-python run_curator.py
+napari-trace
 ```
+
+From there the tool follows the loading flow described below: it finds the CSV,
+mask and movie in that folder, asks you to confirm the column mapping, copies
+everything into an `<experiment>_curated` working folder and opens napari. Your
+original files are never written to.
 
 ### Command-line arguments
 
@@ -203,7 +286,7 @@ python run_curator.py
 Pointing at each file directly:
 
 ```bash
-python run_curator.py --csv tracks.csv --mask labels.tif --image raw.tif
+napari-trace --csv tracks.csv --mask labels.tif --image raw.tif
 ```
 
 ---

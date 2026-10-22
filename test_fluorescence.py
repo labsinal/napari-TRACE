@@ -70,6 +70,85 @@ def test_haralick_contrast_higher_on_textured_than_flat():
     assert c_tex > c_flat
 
 
+def test_lbp_is_invariant_to_intensity_scale():
+    # The whole reason lbp_features exists: it ranks neighbours instead of
+    # binning values, so scaling or offsetting a nucleus must not move it.
+    # Haralick, which quantises over a fixed range, does move -- asserted below
+    # so a future "let's just reuse the GLCM range here" cannot pass silently.
+    mask = np.zeros((1, 16, 16), dtype=np.int32)
+    mask[0, 3:13, 3:13] = 1
+    ch = np.zeros((1, 16, 16), dtype=np.uint16)
+    ch[0, 3:13, 3:13] = (np.indices((10, 10)).sum(axis=0) % 2) * 50 + 40
+    base = fl.lbp_features(ch, mask, channel_name="red")
+    cols = [c for c in base.columns if c.startswith("red_lbp_")]
+    assert cols, "lbp_features produced no channel columns"
+    for transform in (lambda a: a * 2, lambda a: a + 500):
+        moved = fl.lbp_features(transform(ch), mask, channel_name="red")
+        np.testing.assert_allclose(moved[cols].to_numpy(),
+                                   base[cols].to_numpy(), rtol=0, atol=0)
+
+
+def test_two_nuclei_same_pattern_differ_in_haralick_but_not_in_lbp():
+    # Same checkerboard in both nuclei, one twice as bright, same frame. Haralick
+    # bins both over ONE range, so the brighter one lands in wider-apart levels
+    # and reports more contrast although the pattern is identical -- the +0.90
+    # intensity/texture coupling measured on C4_4 (decisoes 2026-08-26). The LBP
+    # only ranks neighbours, so it reports the two as equal, which is what makes
+    # it worth exporting alongside.
+    mask = np.zeros((1, 14, 28), dtype=np.int32)
+    mask[0, 2:12, 2:12] = 1
+    mask[0, 2:12, 16:26] = 2
+    checker = (np.indices((10, 10)).sum(axis=0) % 2) * 50 + 40
+    ch = np.zeros((1, 14, 28), dtype=np.uint16)
+    ch[0, 2:12, 2:12] = checker
+    ch[0, 2:12, 16:26] = checker * 2                  # same pattern, 2x brighter
+    hara = fl.haralick_features(ch, mask, channel_name="red")
+    lbp = fl.lbp_features(ch, mask, channel_name="red")
+    h1, h2 = hara["red_hara_contrast"].to_numpy()
+    assert h2 > h1                                    # brightness leaks into texture
+    np.testing.assert_allclose(lbp["red_lbp_localmax"].to_numpy()[0],
+                               lbp["red_lbp_localmax"].to_numpy()[1], rtol=0, atol=0)
+    np.testing.assert_allclose(lbp["red_lbp_entropy"].to_numpy()[0],
+                               lbp["red_lbp_entropy"].to_numpy()[1], rtol=0, atol=0)
+
+
+def test_lbp_ignores_border_neighbours():
+    # A uniform nucleus on a dark background has NO internal texture, so the
+    # fraction of local maxima must stay near zero. Without eroding the mask the
+    # whole rim compares against background and is counted as a local maximum --
+    # the bug in cell_analyzer's get_lbp_hist.
+    mask = np.zeros((1, 20, 20), dtype=np.int32)
+    mask[0, 5:15, 5:15] = 1
+    ch = np.zeros((1, 20, 20), dtype=np.uint16)
+    ch[0, 5:15, 5:15] = 300
+    got = fl.lbp_features(ch, mask, channel_name="red")["red_lbp_localmax"].iloc[0]
+    assert got < 0.05
+
+
+def test_lbp_small_nucleus_gives_nan_row_not_missing_row():
+    mask = np.zeros((1, 12, 12), dtype=np.int32)
+    mask[0, 5:8, 5:8] = 1                        # 9 px; 1 px left after erosion
+    ch = np.full((1, 12, 12), 100, dtype=np.uint16)
+    df = fl.lbp_features(ch, mask, channel_name="red")
+    assert list(df["track_id"]) == [1]
+    assert df["red_lbp_localmax"].isna().all()
+
+
+def test_haralick_records_its_quantisation_in_attrs():
+    # The CSV travels without the JSON, and the texture columns do not say which
+    # range they were binned over. Whoever reads the export must be able to find
+    # out; see decisoes 2026-08-26 (P3).
+    mask = np.zeros((1, 12, 12), dtype=np.int32)
+    mask[0, 3:9, 3:9] = 1
+    ch = np.random.RandomState(0).randint(0, 500, (1, 12, 12)).astype(np.uint16)
+    df = fl.haralick_features(ch, mask, channel_name="red", levels=16)
+    tx = df.attrs["texture"]
+    assert tx["quantisation"] == "global"
+    assert tx["levels"] == 16
+    assert tx["distances"] == [1]
+    assert np.isfinite(tx["vmin"]) and tx["vmax"] >= tx["vmin"]
+
+
 def test_ring_preview_returns_figure():
     import matplotlib
     matplotlib.use("Agg")
@@ -89,11 +168,23 @@ def test_nuclear_morphometry_has_new_shape_columns():
     mask = np.zeros((1, 20, 20), dtype=np.int32)
     mask[0, 4:16, 6:12] = 1                      # a rectangle (elongated)
     nm = analysis.nuclear_morphometry(mask)
-    for col in ["eccentricity", "solidity", "extent", "orientation",
+    for col in ["eccentricity", "solidity", "orientation",
                 "axis_major_length", "axis_minor_length"]:
         assert col in nm.columns
     assert nm["eccentricity"].iloc[0] > 0.5      # clearly elongated
-    assert 0 < nm["extent"].iloc[0] <= 1.0
+    assert 0 < nm["area_box"].iloc[0] <= 1.0
+
+
+def test_extent_is_not_exported_because_it_duplicates_area_box():
+    # regionprops.extent IS area / axis-aligned-bbox, which is exactly how
+    # area_box is computed. Measured on C4_4: identical to 0.00 across 4422
+    # rows. Two columns holding one number is how "two independent measures"
+    # got asserted once already; see decisoes 2026-08-26.
+    mask = np.zeros((1, 20, 20), dtype=np.int32)
+    mask[0, 4:16, 6:12] = 1
+    nm = analysis.nuclear_morphometry(mask)
+    assert "extent" not in nm.columns
+    assert "extent" not in analysis.MORPHOMETRY_COLS
 
 
 def test_motility_has_anomalous_exponent():

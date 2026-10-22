@@ -1700,7 +1700,7 @@ def build_viewer(state, images, csv_path, mask_path, work_dir,
                      and c not in (COL_TRACK, COL_FRAME)]
     _traj_ts_cols = (["area_px"] if "area_px" not in _traj_ts_cols else []) + _traj_ts_cols
     # Mask-derived columns computable on demand: perimeter/circularity, the NII
-    # morphometry and the shape descriptors (eccentricity, solidity, extent,
+    # morphometry and the shape descriptors (eccentricity, solidity,
     # orientation, axis lengths). Deduped against columns already in the table.
     _extra_traj = ["perimeter", "circularity"] + list(analysis.MORPHOMETRY_COLS)
     _traj_ts_cols += [c for c in _extra_traj if c not in _traj_ts_cols]

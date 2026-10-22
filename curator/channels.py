@@ -203,6 +203,13 @@ def check_measurement_source(array, mask_frames, reference=None, display=None,
             try:
                 import cv2
             except ImportError:
+                # Degrading quietly here would report "no problems found" for a
+                # check that never ran -- the exact failure that lets an
+                # unregistered channel be measured. Say so instead.
+                warnings.append(
+                    "OpenCV (cv2) is not installed, so this channel's "
+                    "alignment with the mask was NOT verified. Install it "
+                    "with: pip install \"napari-TRACE[align]\"")
                 return errors, warnings
             n = arr.shape[0]
             probes = np.unique(np.linspace(0, n - 1, min(int(n_probe), n)).astype(int))

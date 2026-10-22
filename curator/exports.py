@@ -146,6 +146,7 @@ def features_table(df, mask, pixel_size=1.0, frame_interval=1.0,
             out = out.merge(nm, on=[COL_TRACK, COL_FRAME], how="left")
 
     # Per-channel fluorescence features (marked channels only), merged by cell/frame.
+    texture_prov = {}
     ropts = ring_opts or {}
     dil = int(ropts.get("dilation", fluorescence.RING_DILATION_DEFAULT))
     gap = int(ropts.get("gap", fluorescence.RING_GAP_DEFAULT))
@@ -165,8 +166,15 @@ def features_table(df, mask, pixel_size=1.0, frame_interval=1.0,
             hara = fluorescence.haralick_features(stack, mask, channel_name=name,
                                                   background_mode=bg_mode)
             if not hara.empty:
+                # How the GLCM was binned is not visible in the CSV; keep it so
+                # write_all can record it in the provenance sidecar.
+                texture_prov[name] = dict(hara.attrs.get("texture", {}))
                 hara = hara.rename(columns={"track_id": COL_TRACK, "frame": COL_FRAME})
                 out = out.merge(hara, on=[COL_TRACK, COL_FRAME], how="left")
+            lbp = fluorescence.lbp_features(stack, mask, channel_name=name)
+            if not lbp.empty:
+                lbp = lbp.rename(columns={"track_id": COL_TRACK, "frame": COL_FRAME})
+                out = out.merge(lbp, on=[COL_TRACK, COL_FRAME], how="left")
 
     # Interactive-readout tables (ERK-KTR, 53BP1) accumulated in the session.
     for extra in (extra_tables or []):
@@ -193,6 +201,8 @@ def features_table(df, mask, pixel_size=1.0, frame_interval=1.0,
 
     out = out.reset_index(drop=True)
     _add_lifetime_midframe(out, frame_interval, time_table=time_table)
+    if texture_prov:
+        out.attrs["texture"] = texture_prov
     return out
 
 
@@ -386,6 +396,11 @@ def write_all(work_dir, df, mask, reviewed_roots, validated_cells, base_name,
 
     if provenance:
         import json
+        # The quantisation range is decided inside haralick_features, not by the
+        # caller, so it can only be recorded after the table exists.
+        if features is not None and features.attrs.get("texture"):
+            provenance = dict(provenance)
+            provenance["texture"] = features.attrs["texture"]
         prov_path = os.path.join(out_dir, f"{base_name}_measurement_provenance.json")
         tmp = prov_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:

@@ -786,7 +786,7 @@ def auto_flag_border_exits(df, mask=None, tail=5, min_tail=3,
 # Nuclear morphometry (NII and its components, after Filippi-Chiela et al. 2012)
 # ---------------------------------------------------------------------------
 NMA_COLS = ["aspect", "area_box", "radius_ratio", "roundness", "nii"]
-_SHAPE_COLS = ["eccentricity", "solidity", "extent", "orientation",
+_SHAPE_COLS = ["eccentricity", "solidity", "orientation",
                "axis_major_length", "axis_minor_length"]
 MORPHOMETRY_COLS = ["area_px", "perimeter", "circularity"] + NMA_COLS + _SHAPE_COLS
 
@@ -834,10 +834,23 @@ def nuclear_morphometry(mask):
 
     Also returns area_px, perimeter and circularity (= 1/roundness) so the table
     is a superset of morphology_timeseries(), plus the standard regionprops shape
-    descriptors (eccentricity, solidity, extent, orientation, axis_major_length,
+    descriptors (eccentricity, solidity, orientation, axis_major_length,
     axis_minor_length). Returns columns: frame, track_id, area_px, perimeter,
     circularity, aspect, area_box, radius_ratio, roundness, nii, eccentricity,
-    solidity, extent, orientation, axis_major_length, axis_minor_length.
+    solidity, orientation, axis_major_length, axis_minor_length.
+
+    regionprops.extent is deliberately NOT exported: it IS area / axis-aligned
+    bbox area, which is exactly how area_box is computed below, so the two are
+    the same number under two names (verified identical across C4_4). area_box
+    is the one that keeps it, because it is a term of the NII.
+
+    Note on area_box: the bounding box is aligned to the image axes, so it grows
+    when the nucleus is diagonal and area_box dips accordingly. Measured on C4_4,
+    area_box correlates -0.46 with |sin(2*orientation)| within track -- part of
+    this column, and hence of the NII, follows the cell rotating rather than the
+    cell changing shape. A rotated minAreaRect removes it; it was not adopted
+    because it moved 2 of 82 cell-phases in the NMA and would invalidate every
+    NII already on record.
     """
     from skimage.measure import regionprops
     cols = ["frame", "track_id"] + MORPHOMETRY_COLS
@@ -872,7 +885,6 @@ def nuclear_morphometry(mask):
                 "nii": float(nii),
                 "eccentricity": float(r.eccentricity),
                 "solidity": float(r.solidity),
-                "extent": float(r.extent),
                 "orientation": float(r.orientation),
                 "axis_major_length": float(r.axis_major_length),
                 "axis_minor_length": float(r.axis_minor_length)})

@@ -529,7 +529,7 @@ def trajectories(df, mask=None, mode="timeseries", y_col=None,
         elif col == "area_px":
             d = analysis.annotate_area(d, mask)
         elif col in analysis.MORPHOMETRY_COLS:
-            # NII plus the shape descriptors (eccentricity, solidity, extent,
+            # NII plus the shape descriptors (eccentricity, solidity,
             # orientation, axis lengths) -- all come from nuclear_morphometry.
             src = analysis.nuclear_morphometry(mask)
             if src.empty:

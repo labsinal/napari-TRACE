@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "napari-TRACE"
-version = "0.6.1"
-description = "Tracking Review and Correction Engine - napari plugin for curating cell-tracking results"
+dynamic = ["version"]   # single source of truth: curator/__init__.py
+description = "Tracking Review and Correction Engine - napari-based desktop tool for curating cell-tracking results"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = { text = "BSD-3-Clause" }
@@ -26,16 +26,30 @@ dependencies = [
   # never plugin-after-app, or a lone `pip install napari-TRACE` can bump numpy.
   "numpy>=1.24",
   "pandas>=2.0",
-  "scikit-image>=0.20",
+  # Capped on purpose: regionprops and the Haralick texture set can return
+  # slightly different values across scikit-image minor versions, so the same
+  # movie is not guaranteed to give the same number. The launch banner prints
+  # the resolved version -- record it with your results.
+  "scikit-image>=0.24,<0.26",
   "scipy>=1.10",
   "tifffile>=2023.1.1",
   "matplotlib>=3.5",
 ]
 
+[project.optional-dependencies]
+# The fluorescence-channel loader verifies, by phase correlation, that an extra
+# channel is registered against the movie the mask was built on. That check is
+# the only thing here that needs OpenCV, so it stays optional -- but without it
+# the loader can only report that the alignment was not verified.
+align = ["opencv-python-headless>=4.8"]
+
 # Lets forNMA (or anyone) launch the curator from the installed environment
 # without knowing the source folder: `napari-trace` or `python -m curator.app`.
 [project.scripts]
 napari-trace = "curator.app:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "curator.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["curator*"]

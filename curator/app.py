@@ -48,8 +48,35 @@ def ask_directory(title, folder):
     return QFileDialog.getExistingDirectory(None, title, start) or None
 
 
+def _print_versions():
+    """Print the library versions this session runs on, as one copyable line.
+
+    Shape and texture features are computed through scikit-image, whose minor
+    versions can return slightly different values for the same image, so a
+    number is only interpretable next to the versions that produced it. Our own
+    version comes from the source (installed metadata goes stale in an editable
+    install); the rest is read from the metadata, so this does not import napari.
+    """
+    import platform
+    from importlib.metadata import PackageNotFoundError, version
+
+    from . import __version__
+
+    def v(pkg):
+        try:
+            return version(pkg)
+        except PackageNotFoundError:
+            return "?"
+
+    print(f"napari-TRACE {__version__} | python {platform.python_version()} "
+          f"| numpy {v('numpy')} | pandas {v('pandas')} "
+          f"| scikit-image {v('scikit-image')} | napari {v('napari')}",
+          flush=True)
+
+
 def main():
     _ensure_qt_app()
+    _print_versions()
 
     parser = argparse.ArgumentParser(description="Track curation tool (napari)")
     parser.add_argument("folder", nargs="?", default=None,
